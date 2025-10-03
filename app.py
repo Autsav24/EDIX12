@@ -34,32 +34,32 @@ if "profiles" not in st.session_state:
 
 st.title("📡 X12 EDI – 270/271 (Profile-ready MVP)")
 
-# ---------------- Manage Profiles Panel ----------------
+# ---------------- Manage Profiles Panel (unique keys to avoid collisions) ----------------
 with st.expander("⚙️ Manage Payer Profiles"):
     profiles = st.session_state.profiles
     keys = list(profiles.keys())
     sel_idx = keys.index("default") if "default" in keys else 0
-    sel = st.selectbox("Select profile to view/edit", options=keys, index=sel_idx)
+    sel = st.selectbox("Select profile to view/edit", options=keys, index=sel_idx, key="mp_select_profile")
 
     cur = profiles.get(sel, {})
     col1, col2, col3 = st.columns(3)
     with col1:
-        new_key = st.text_input("Profile key (unique ID)", value=sel)
-        preferred_eq = st.text_input("Preferred EQ (comma-separated)", value=",".join(cur.get("preferred_eq", ["30"])))
-        id_qual = st.text_input("ID Qualifier (e.g., MI)", value=cur.get("id_qual", "MI"))
+        new_key = st.text_input("Profile key (unique ID)", value=sel, key="mp_profile_key")
+        preferred_eq = st.text_input("Preferred EQ (comma-separated)", value=",".join(cur.get("preferred_eq", ["30"])), key="mp_preferred_eq")
+        id_qual = st.text_input("ID Qualifier (e.g., MI)", value=cur.get("id_qual", "MI"), key="mp_id_qual")
     with col2:
-        require_dmg = st.checkbox("Require DMG (DOB/Gender)", value=cur.get("require_dmg", False))
-        expect_trn = st.checkbox("Include TRN", value=cur.get("expect_trn", True))
-        include_prv = st.checkbox("Include PRV (taxonomy)", value=cur.get("include_prv", False))
-        provider_taxonomy = st.text_input("Provider Taxonomy (PRV03)", value=cur.get("provider_taxonomy", ""))
+        require_dmg = st.checkbox("Require DMG (DOB/Gender)", value=cur.get("require_dmg", False), key="mp_require_dmg")
+        expect_trn = st.checkbox("Include TRN", value=cur.get("expect_trn", True), key="mp_expect_trn")
+        include_prv_mp = st.checkbox("Include PRV (taxonomy)", value=cur.get("include_prv", False), key="mp_include_prv")
+        provider_taxonomy_mp = st.text_input("Provider Taxonomy (PRV03)", value=cur.get("provider_taxonomy", ""), key="mp_provider_taxonomy")
     with col3:
-        include_addresses = st.checkbox("Include Addresses (N3/N4)", value=cur.get("include_addresses", False))
-        extra_ref = st.text_input("Extra REF codes (comma-separated)", value=",".join(cur.get("extra_ref", [])))
-        subscriber_is_primary = st.checkbox("Subscriber is Primary", value=cur.get("subscriber_is_primary", True))
+        include_addresses_mp = st.checkbox("Include Addresses (N3/N4)", value=cur.get("include_addresses", False), key="mp_include_addresses")
+        extra_ref = st.text_input("Extra REF codes (comma-separated)", value=",".join(cur.get("extra_ref", [])), key="mp_extra_ref")
+        subscriber_is_primary = st.checkbox("Subscriber is Primary", value=cur.get("subscriber_is_primary", True), key="mp_sub_is_primary")
 
     c1, c2, c3, c4 = st.columns([1,1,1,1])
     with c1:
-        if st.button("💾 Save/Update Profile"):
+        if st.button("💾 Save/Update Profile", key="mp_save"):
             profiles[new_key] = {
                 "preferred_eq": [x.strip() for x in preferred_eq.split(",") if x.strip()],
                 "require_dmg": require_dmg,
@@ -67,32 +67,32 @@ with st.expander("⚙️ Manage Payer Profiles"):
                 "id_qual": id_qual.strip() or "MI",
                 "subscriber_is_primary": subscriber_is_primary,
                 "extra_ref": [x.strip() for x in extra_ref.split(",") if x.strip()],
-                "include_prv": include_prv,
-                "provider_taxonomy": provider_taxonomy.strip(),
-                "include_addresses": include_addresses,
+                "include_prv": include_prv_mp,
+                "provider_taxonomy": provider_taxonomy_mp.strip(),
+                "include_addresses": include_addresses_mp,
             }
             if new_key != sel and sel in profiles:
                 del profiles[sel]
             save_profiles(profiles)
-            st.success(f"Profile '{new_key}' saved.")
+            st.success(f"Profile '{new_key}' saved.", icon="✅")
     with c2:
-        if st.button("🗑️ Delete Profile", disabled=(sel == "default")):
+        if st.button("🗑️ Delete Profile", disabled=(sel == "default"), key="mp_delete"):
             if sel != "default" and sel in profiles:
                 del profiles[sel]
                 save_profiles(profiles)
-                st.success(f"Profile '{sel}' deleted.")
+                st.success(f"Profile '{sel}' deleted.", icon="🗑️")
     with c3:
         exported = json.dumps(profiles, indent=2, ensure_ascii=False).encode("utf-8")
-        st.download_button("⬇️ Export All Profiles (JSON)", data=exported, file_name="profiles.json", mime="application/json")
+        st.download_button("⬇️ Export All Profiles (JSON)", data=exported, file_name="profiles.json", mime="application/json", key="mp_export")
     with c4:
-        up = st.file_uploader("Import Profiles (JSON)", type=["json"], label_visibility="collapsed")
+        up = st.file_uploader("Import Profiles (JSON)", type=["json"], label_visibility="collapsed", key="mp_import")
         if up:
             try:
                 imported = json.loads(up.read().decode("utf-8"))
                 for k, v in imported.items():
                     profiles[k] = v
                 save_profiles(profiles)
-                st.success("Profiles imported and saved.")
+                st.success("Profiles imported and saved.", icon="📥")
             except Exception as e:
                 st.error(f"Import failed: {e}")
 
@@ -118,69 +118,70 @@ def normalize_punctuation(text: str) -> str:
 # ---------------- Tabs ----------------
 tab_build, tab_parse, tab_help = st.tabs(["Build 270", "Parse 271", "Help & Notes"])
 
-# ===== Build 270 (profile-aware, PRV + N3/N4) =====
+# ===== Build 270 (profile-aware, PRV + N3/N4; all unique keys) =====
 with tab_build:
     st.subheader("Build a 270 Request")
 
     profiles = st.session_state.profiles
     pkeys = list(profiles.keys())
     pidx = pkeys.index("default") if "default" in pkeys else 0
-    profile_key = st.selectbox("Payer Profile", options=pkeys, index=pidx)
+    profile_key = st.selectbox("Payer Profile", options=pkeys, index=pidx, key="b_profile_select")
     profile = profiles[profile_key]
 
     colA, colB, colC = st.columns([1,1,1])
     with colA:
-        payer_id = st.text_input("Payer ID (PI)", value="12345")
-        prov_name = st.text_input("Provider Name", value="Buddha Clinic")
-        npi = st.text_input("Provider NPI", value="1234567890")
+        payer_id = st.text_input("Payer ID (PI)", value="12345", key="b_payer_id")
+        prov_name = st.text_input("Provider Name", value="Buddha Clinic", key="b_prov_name")
+        npi = st.text_input("Provider NPI", value="1234567890", key="b_npi")
     with colB:
-        subscriber_last = st.text_input("Subscriber Last Name", value="DOE")
-        subscriber_first = st.text_input("Subscriber First Name", value="JOHN")
-        subscriber_id = st.text_input("Subscriber Member ID", value="W123456789")
-        trn_trace = st.text_input("TRN Trace (optional)", value="TRACE12345")
+        subscriber_last = st.text_input("Subscriber Last Name", value="DOE", key="b_sub_last")
+        subscriber_first = st.text_input("Subscriber First Name", value="JOHN", key="b_sub_first")
+        subscriber_id = st.text_input("Subscriber Member ID", value="W123456789", key="b_sub_id")
+        trn_trace = st.text_input("TRN Trace (optional)", value="TRACE12345", key="b_trn")
     with colC:
         default_eq = profile.get("preferred_eq", ["30"])
         service_types = st.multiselect(
             "Service Type Codes (EQ)",
             options=list(ServiceTypeMap.keys()),
             default=default_eq,
-            format_func=lambda x: f"{x} – {ServiceTypeMap.get(x,'')}"
+            format_func=lambda x: f"{x} – {ServiceTypeMap.get(x,'')}",
+            key="b_eq_multiselect"
         )
-        dt_start = st.date_input("Eligibility Start", datetime.today().date())
-        ranged = st.checkbox("Use Date Range (RD8)", value=True)
-        dt_end = st.date_input("Eligibility End", datetime.today().date() + timedelta(days=30)) if ranged else None
+        dt_start = st.date_input("Eligibility Start", datetime.today().date(), key="b_dt_start")
+        ranged = st.checkbox("Use Date Range (RD8)", value=True, key="b_ranged")
+        dt_end = st.date_input("Eligibility End", datetime.today().date() + timedelta(days=30), key="b_dt_end") if ranged else None
 
     with st.expander("Provider Details (PRV + Address)"):
-        include_prv = st.checkbox("Include PRV (taxonomy)", value=profile.get("include_prv", False))
-        provider_taxonomy = st.text_input("Provider Taxonomy (PRV03)", value=profile.get("provider_taxonomy",""))
-        include_addresses = st.checkbox("Include Addresses (N3/N4)", value=profile.get("include_addresses", False))
+        include_prv = st.checkbox("Include PRV (taxonomy)", value=profile.get("include_prv", False), key="b_include_prv")
+        provider_taxonomy = st.text_input("Provider Taxonomy (PRV03)", value=profile.get("provider_taxonomy",""), key="b_provider_taxonomy")
+        include_addresses = st.checkbox("Include Addresses (N3/N4)", value=profile.get("include_addresses", False), key="b_include_addresses")
 
         st.caption("Provider Address (optional)")
-        p_line1 = st.text_input("Provider Address Line 1", value="")
-        p_line2 = st.text_input("Provider Address Line 2", value="")
-        p_city  = st.text_input("Provider City", value="")
-        p_state = st.text_input("Provider State (2-letter)", value="")
-        p_zip   = st.text_input("Provider ZIP", value="")
+        p_line1 = st.text_input("Provider Address Line 1", value="", key="b_p_line1")
+        p_line2 = st.text_input("Provider Address Line 2", value="", key="b_p_line2")
+        p_city  = st.text_input("Provider City", value="", key="b_p_city")
+        p_state = st.text_input("Provider State (2-letter)", value="", key="b_p_state")
+        p_zip   = st.text_input("Provider ZIP", value="", key="b_p_zip")
 
     with st.expander("Subscriber Demographics & Address"):
         require_dmg = profile.get("require_dmg", False)
-        dmg_dob = st.text_input("DOB (YYYYMMDD)", value="19800101" if require_dmg else "")
-        dmg_gender = st.selectbox("Gender", ["", "M", "F", "U"], index=0 if not require_dmg else 3)
+        dmg_dob = st.text_input("DOB (YYYYMMDD)", value="19800101" if require_dmg else "", key="b_dmg_dob")
+        dmg_gender = st.selectbox("Gender", ["", "M", "F", "U"], index=0 if not require_dmg else 3, key="b_dmg_gender")
 
         st.caption("Subscriber Address (optional, used if 'Include Addresses' is checked)")
-        s_line1 = st.text_input("Subscriber Address Line 1", value="")
-        s_line2 = st.text_input("Subscriber Address Line 2", value="")
-        s_city  = st.text_input("Subscriber City", value="")
-        s_state = st.text_input("Subscriber State (2-letter)", value="")
-        s_zip   = st.text_input("Subscriber ZIP", value="")
+        s_line1 = st.text_input("Subscriber Address Line 1", value="", key="b_s_line1")
+        s_line2 = st.text_input("Subscriber Address Line 2", value="", key="b_s_line2")
+        s_city  = st.text_input("Subscriber City", value="", key="b_s_city")
+        s_state = st.text_input("Subscriber State (2-letter)", value="", key="b_s_state")
+        s_zip   = st.text_input("Subscriber ZIP", value="", key="b_s_zip")
 
     with st.expander("Dependent (optional)"):
-        use_dependent = st.checkbox("Query Dependent?", value=False)
-        dep_last = st.text_input("Dependent Last Name", value="") if use_dependent else ""
-        dep_first = st.text_input("Dependent First Name", value="") if use_dependent else ""
-        dep_id = st.text_input("Dependent ID", value="") if use_dependent else ""
+        use_dependent = st.checkbox("Query Dependent?", value=False, key="b_dep_use")
+        dep_last = st.text_input("Dependent Last Name", value="", key="b_dep_last") if use_dependent else ""
+        dep_first = st.text_input("Dependent First Name", value="", key="b_dep_first") if use_dependent else ""
+        dep_id = st.text_input("Dependent ID", value="", key="b_dep_id") if use_dependent else ""
 
-    if st.button("Generate 270"):
+    if st.button("Generate 270", key="b_generate"):
         provider = Provider(name=prov_name, npi=npi)
         subscriber = Party(last=subscriber_last, first=subscriber_first, id_code=subscriber_id, id_qual=profile.get("id_qual","MI"))
         dependent = None
@@ -220,8 +221,8 @@ with tab_build:
                 cols = st.columns(len(extra_ref_codes))
                 ref_vals = {}
                 for i, code in enumerate(extra_ref_codes):
-                    ref_vals[code] = cols[i].text_input(f"REF*{code} value", value="")
-                if st.button("Apply REF values"):
+                    ref_vals[code] = cols[i].text_input(f"REF*{code} value", value="", key=f"b_ref_{code}")
+                if st.button("Apply REF values", key="b_apply_ref"):
                     for code, val in ref_vals.items():
                         if val:
                             edi270 = edi270.replace(f"REF*{code}*PLACEHOLDER", f"REF*{code}*{val}")
@@ -231,14 +232,15 @@ with tab_build:
             "⬇️ Download 270",
             data=edi270.encode("utf-8"),
             file_name=f"270_{subscriber_last}_{datetime.now().strftime('%Y%m%d%H%M')}.x12",
-            mime="text/plain"
+            mime="text/plain",
+            key="b_download"
         )
 
 # ===== Parse 271 =====
 with tab_parse:
     st.subheader("Parse a 271 Response")
 
-    uploaded = st.file_uploader("Upload 271 (text/X12 or ZIP)", type=["x12","edi","txt","dat","zip"])
+    uploaded = st.file_uploader("Upload 271 (text/X12 or ZIP)", type=["x12","edi","txt","dat","zip"], key="p_upload")
     if uploaded:
         raw = uploaded.read()
 
