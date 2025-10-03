@@ -105,10 +105,12 @@ def build_IEA(control_num: int, group_count: int = 1,
 def build_GS(control_num: int, sender_code: str, receiver_code: str,
              elem_t: str = DEFAULT_ELEM, seg_t: str = DEFAULT_SEG) -> str:
     now = datetime.utcnow()
+    # 270 inquiry => GS01 must be HS (HB is for 271 response)
     return elem_t.join([
-        "GS","HB",sender_code,receiver_code,now.strftime("%Y%m%d"), now.strftime("%H%M"),
+        "GS","HS",sender_code,receiver_code,now.strftime("%Y%m%d"), now.strftime("%H%M"),
         str(control_num),"X","005010X279A1"
     ]) + seg_t
+
 
 def build_GE(control_num: int, txn_count: int = 1,
              elem_t: str = DEFAULT_ELEM, seg_t: str = DEFAULT_SEG) -> str:
@@ -371,3 +373,4 @@ def normalize_eb_for_reporting(eb_rows: List[Dict]) -> Dict[str, Optional[str]]:
         if r.get("InPlan"):
             summary["InNetwork"] = "Yes" if r["InPlan"] == "Y" else ("No" if r["InPlan"] == "N" else None)
     return summary
+
