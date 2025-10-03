@@ -13,7 +13,6 @@ st.set_page_config(page_title="X12 EDI – 270/271 (Profiles)", page_icon="📡"
 PROFILES_FILE = "profiles.json"
 
 def load_profiles() -> dict:
-    """Merge built-in profiles from edi_x12 with any user-defined profiles saved on disk."""
     base = {k: v.copy() for k, v in PAYER_PROFILES.items()}
     if os.path.exists(PROFILES_FILE):
         try:
@@ -34,7 +33,7 @@ if "profiles" not in st.session_state:
 
 st.title("📡 X12 EDI – 270/271 (Profile-ready MVP)")
 
-# ---------------- Manage Profiles Panel (unique keys to avoid collisions) ----------------
+# ---------------- Manage Profiles Panel (unique keys) ----------------
 with st.expander("⚙️ Manage Payer Profiles"):
     profiles = st.session_state.profiles
     keys = list(profiles.keys())
@@ -49,13 +48,16 @@ with st.expander("⚙️ Manage Payer Profiles"):
         id_qual = st.text_input("ID Qualifier (e.g., MI)", value=cur.get("id_qual", "MI"), key="mp_id_qual")
     with col2:
         require_dmg = st.checkbox("Require DMG (DOB/Gender)", value=cur.get("require_dmg", False), key="mp_require_dmg")
+        dep_require_dmg = st.checkbox("Dependent requires DMG", value=cur.get("dependent_require_dmg", False), key="mp_dep_require_dmg")
+        dep_id_required = st.checkbox("Dependent ID required (NM109)", value=cur.get("dependent_id_required", False), key="mp_dep_id_required")
         expect_trn = st.checkbox("Include TRN", value=cur.get("expect_trn", True), key="mp_expect_trn")
+    with col3:
         include_prv_mp = st.checkbox("Include PRV (taxonomy)", value=cur.get("include_prv", False), key="mp_include_prv")
         provider_taxonomy_mp = st.text_input("Provider Taxonomy (PRV03)", value=cur.get("provider_taxonomy", ""), key="mp_provider_taxonomy")
-    with col3:
         include_addresses_mp = st.checkbox("Include Addresses (N3/N4)", value=cur.get("include_addresses", False), key="mp_include_addresses")
         extra_ref = st.text_input("Extra REF codes (comma-separated)", value=",".join(cur.get("extra_ref", [])), key="mp_extra_ref")
-        subscriber_is_primary = st.checkbox("Subscriber is Primary", value=cur.get("subscriber_is_primary", True), key="mp_sub_is_primary")
+
+    subscriber_is_primary = st.checkbox("Subscriber is Primary", value=cur.get("subscriber_is_primary", True), key="mp_sub_is_primary")
 
     c1, c2, c3, c4 = st.columns([1,1,1,1])
     with c1:
@@ -63,6 +65,8 @@ with st.expander("⚙️ Manage Payer Profiles"):
             profiles[new_key] = {
                 "preferred_eq": [x.strip() for x in preferred_eq.split(",") if x.strip()],
                 "require_dmg": require_dmg,
+                "dependent_require_dmg": dep_require_dmg,
+                "dependent_id_required": dep_id_required,
                 "expect_trn": expect_trn,
                 "id_qual": id_qual.strip() or "MI",
                 "subscriber_is_primary": subscriber_is_primary,
@@ -118,7 +122,7 @@ def normalize_punctuation(text: str) -> str:
 # ---------------- Tabs ----------------
 tab_build, tab_parse, tab_help = st.tabs(["Build 270", "Parse 271", "Help & Notes"])
 
-# ===== Build 270 (profile-aware, PRV + N3/N4; all unique keys) =====
+# ===== Build 270 =====
 with tab_build:
     st.subheader("Build a 270 Request")
 
@@ -151,6 +155,7 @@ with tab_build:
         ranged = st.checkbox("Use Date Range (RD8)", value=True, key="b_ranged")
         dt_end = st.date_input("Eligibility End", datetime.today().date() + timedelta(days=30), key="b_dt_end") if ranged else None
 
+    # Provider details
     with st.expander("Provider Details (PRV + Address)"):
         include_prv = st.checkbox("Include PRV (taxonomy)", value=profile.get("include_prv", False), key="b_include_prv")
         provider_taxonomy = st.text_input("Provider Taxonomy (PRV03)", value=profile.get("provider_taxonomy",""), key="b_provider_taxonomy")
@@ -163,10 +168,11 @@ with tab_build:
         p_state = st.text_input("Provider State (2-letter)", value="", key="b_p_state")
         p_zip   = st.text_input("Provider ZIP", value="", key="b_p_zip")
 
+    # Subscriber DMG + address
     with st.expander("Subscriber Demographics & Address"):
         require_dmg = profile.get("require_dmg", False)
-        dmg_dob = st.text_input("DOB (YYYYMMDD)", value="19800101" if require_dmg else "", key="b_dmg_dob")
-        dmg_gender = st.selectbox("Gender", ["", "M", "F", "U"], index=0 if not require_dmg else 3, key="b_dmg_gender")
+        dmg_dob = st.text_input("Subscriber DOB (YYYYMMDD)", value="19800101" if require_dmg else "", key="b_dmg_dob")
+        dmg_gender = st.selectbox("Subscriber Gender", ["", "M", "F", "U"], index=0 if not require_dmg else 3, key="b_dmg_gender")
 
         st.caption("Subscriber Address (optional, used if 'Include Addresses' is checked)")
         s_line1 = st.text_input("Subscriber Address Line 1", value="", key="b_s_line1")
@@ -175,18 +181,22 @@ with tab_build:
         s_state = st.text_input("Subscriber State (2-letter)", value="", key="b_s_state")
         s_zip   = st.text_input("Subscriber ZIP", value="", key="b_s_zip")
 
+    # Dependent loop
     with st.expander("Dependent (optional)"):
         use_dependent = st.checkbox("Query Dependent?", value=False, key="b_dep_use")
         dep_last = st.text_input("Dependent Last Name", value="", key="b_dep_last") if use_dependent else ""
         dep_first = st.text_input("Dependent First Name", value="", key="b_dep_first") if use_dependent else ""
-        dep_id = st.text_input("Dependent ID", value="", key="b_dep_id") if use_dependent else ""
+        dep_id = st.text_input("Dependent ID (NM109) – leave blank if none", value="", key="b_dep_id") if use_dependent else ""
+        dep_dmg_dob = st.text_input("Dependent DOB (YYYYMMDD)", value="", key="b_dep_dob") if use_dependent else ""
+        dep_dmg_gender = st.selectbox("Dependent Gender", ["", "M", "F", "U"], index=0, key="b_dep_gender") if use_dependent else ""
 
     if st.button("Generate 270", key="b_generate"):
         provider = Provider(name=prov_name, npi=npi)
         subscriber = Party(last=subscriber_last, first=subscriber_first, id_code=subscriber_id, id_qual=profile.get("id_qual","MI"))
+
         dependent = None
         if use_dependent:
-            dependent = Party(last=dep_last, first=dep_first, id_code=dep_id, id_qual=profile.get("id_qual","MI"))
+            dependent = Party(last=dep_last, first=dep_first, id_code=dep_id or "", id_qual=profile.get("id_qual","MI"))
 
         prov_addr = {"line1": p_line1, "line2": p_line2, "city": p_city, "state": p_state, "zip": p_zip}
         subs_addr = {"line1": s_line1, "line2": s_line2, "city": s_city, "state": s_state, "zip": s_zip}
@@ -209,6 +219,8 @@ with tab_build:
             include_addresses=include_addresses,
             provider_addr=prov_addr if any(prov_addr.values()) else None,
             subscriber_addr=subs_addr if any(subs_addr.values()) else None,
+            dep_dmg_dob=dep_dmg_dob or None,
+            dep_dmg_gender=dep_dmg_gender or None,
         )
 
         st.write("### Generated 270")
@@ -315,16 +327,18 @@ with tab_parse:
 # ===== Help =====
 with tab_help:
     st.markdown("""
-### What this app does
-- **Build 270** (005010X279A1): profile-aware envelopes, optional PRV (taxonomy) and N3/N4 addresses, extra REF codes.
-- **Parse 271**: robust delimiter/encoding handling; shows NM1/EB/AAA/DTP/REF, plus a quick eligibility summary.
-- **Profiles**: create/edit/delete/import/export payer profiles from the UI (saved to `profiles.json`).
+### What changed (for dependents)
+- Builder now **omits `MI*`** when a dependent ID is not supplied (prevents invalid `MI*` with blank ID).
+- Added **Dependent DMG** inputs and support. If your profile sets `dependent_require_dmg=True`, the builder will always include `DMG` for 2100D.
+- Two new profile flags:
+  - `dependent_require_dmg`: enforce dependent DOB/Gender
+  - `dependent_id_required`: (advisory) if you set this to True but don't supply an ID, the 270 is still syntactically valid but your payer may reject it.
 
 ### Tips
-- Many payers prefer `EQ=30`. If you get no EB rows, try just 30.
-- Use real DOB/Gender in **DMG** if the payer requires it.
-- Replace `REF*..*PLACEHOLDER` with real IDs via the “Replace REF placeholders” expander.
+- If a payer requires dependent ID, make sure you fill **Dependent ID (NM109)**.
+- Many payers accept dependent **name + DOB/Gender** without a separate ID—use that when you don’t have a dependent ID.
+- If you get no EB back, try **EQ=30** only.
 
 ### Security
-Treat member data as PHI. Use secure storage/transport when you go beyond testing.
+Treat member data as PHI. Use secure storage/transport when moving beyond testing.
 """)
