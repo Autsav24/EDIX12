@@ -1,14 +1,37 @@
-﻿# app.py
+# app.py
 import io
 import zipfile
 import streamlit as st
 from datetime import datetime, timedelta
-from edi_x12 import (
-    Provider, Party, build_270, parse_271, ServiceTypeMap
-)
+from edi_x12 import Provider, Party, build_270, parse_271, ServiceTypeMap
 
 st.set_page_config(page_title="X12 EDI – 270/271", page_icon="📡", layout="wide")
 st.title("📡 X12 EDI – 270/271 Eligibility (MVP)")
+
+# --------- Robust decoder (fixes cp1252 0x96 etc.) ----------
+def robust_decode(raw: bytes) -> str:
+    """
+    Decode X12 text from common encodings.
+    Prioritizes cp1252 because 0x96 (–) is common in Windows-encoded files.
+    Falls back to 'replace' to avoid hard crashes.
+    """
+    if raw.startswith(b"%PDF"):
+        raise ValueError("Not a plain-text X12 file (PDF detected).")
+    if raw[:2] == b"\x1f\x8b":
+        raise ValueError("GZIP detected. Please upload the uncompressed X12 file or a ZIP.")
+
+    for enc in ("cp1252", "utf-8", "utf-8-sig", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+def normalize_punctuation(text: str) -> str:
+    return (text.replace("\u2013", "-").replace("\u2014", "-")
+                .replace("\u2018", "'").replace("\u2019", "'")
+                .replace("\u201c", '"').replace("\u201d", '"')
+                .replace("\u00a0", " "))
 
 tab_build, tab_parse, tab_help = st.tabs(["Build 270", "Parse 271", "Help & Notes"])
 
@@ -82,44 +105,31 @@ with tab_parse:
         if uploaded.name.lower().endswith(".zip"):
             try:
                 with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                    # pick the first file-like entry
                     names = [n for n in zf.namelist() if not n.endswith("/")]
                     if not names:
-                        st.error("ZIP has no files")
-                        st.stop()
+                        st.error("ZIP has no files"); st.stop()
                     raw = zf.read(names[0])
             except zipfile.BadZipFile:
                 st.error("Uploaded file looks like a ZIP but couldn't be opened.")
                 st.stop()
 
-        # Guard: PDFs uploaded by mistake
-        if raw[:4] == b"%PDF":
-            st.error("This appears to be a PDF, not a raw X12 271. Please upload the .x12/.edi text file.")
-            st.stop()
+        try:
+            content = normalize_punctuation(robust_decode(raw))
+        except ValueError as e:
+            st.error(str(e)); st.stop()
 
-        # Try decodings (handles cp1252 where 0x96 en-dash exists)
-        decoded = None
-        for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
-            try:
-                decoded = raw.decode(enc)
-                break
-            except UnicodeDecodeError:
-                continue
-        if decoded is None:
-            decoded = raw.decode("utf-8", errors="replace")
+        parsed = parse_271(content)
 
-        # Normalize some “smart” punctuation and non-breaking spaces
-        replacements = {
-            "\u2013": "-", "\u2014": "-",
-            "\u2018": "'", "\u2019": "'",
-            "\u201c": '"', "\u201d": '"',
-            "\u00a0": " ",
-        }
-        for k, v in replacements.items():
-            decoded = decoded.replace(k, v)
-
-        # Parse
-        parsed = parse_271(decoded)
+        # Debug info
+        with st.expander("🔎 Debug parser info"):
+            dbg = parsed.get("_debug", {})
+            st.write({
+                "segment_terminator": dbg.get("segment_terminator"),
+                "element_separator": dbg.get("element_separator"),
+                "segment_count": dbg.get("segment_count"),
+                "first_tags": dbg.get("first_tags"),
+            })
+            st.code(content[:400].replace("\r", "\\r").replace("\n", "\\n\n"))
 
         st.write("### Payer")
         st.json(parsed.get("payer", {}))
@@ -153,7 +163,7 @@ with tab_parse:
             st.dataframe(parsed["ref"], use_container_width=True)
 
         st.write("### Raw 271 (first 2000 chars)")
-        preview = decoded[:2000] + ("...\n" if len(decoded) > 2000 else "")
+        preview = content[:2000] + ("...\n" if len(content) > 2000 else "")
         st.code(preview, language="plain")
 
 # =========================
@@ -163,17 +173,16 @@ with tab_help:
     st.markdown("""
 ### How this MVP works
 - **Build 270**: Creates a simple eligibility request with ISA/GS/ST envelopes, payer (NM1*PR), provider (NM1*1P),
-  subscriber (NM1*IL) and optional dependent (NM1*QD), date (DTP*291), and one or more service types (EQ).
+  subscriber (NM1*IL) and optional dependent (NM1*QD), date (DTP*291), and service types (EQ).
 - **Parse 271**: Pragmatically parses NM1 (payer/provider/subscriber/dependent), EB (benefits), AAA (rejections),
-  and surfaces REF/DTP segments. It does not fully implement every variation from payer companion guides.
+  and surfaces REF/DTP segments. Companion guides vary; extend as needed.
 
-### Common tips
-- If a payer returns **no EB**, try service type **EQ=30** (many payers prefer this over **1**).
-- Ensure **control numbers** (ISA13/GS06/ST02) are unique in production; store counters in a DB.
-- Respect partner **companion guides** for exact qualifiers (REF/TRN/DMG), date rules, and loop usage.
+### Tips
+- If a payer returns **no EB**, try **EQ = 30** (general plan coverage).
+- Ensure unique control numbers (`ISA13`, `GS06`, `ST02`) in production (store counters in DB).
+- Follow each trading partner's **companion guide** for exact REF/TRN/DMG rules.
 
-### Production notes
-- Persist requests/responses and counters in a secure DB (Postgres/Supabase/Neon).
-- Use secure transport (AS2/SFTP) via your clearinghouse or partner.
-- Treat all member data as PHI and follow HIPAA best practices.
+### Security (when you go beyond testing)
+- Treat member data as **PHI**; store securely (e.g., Postgres with encryption, least-privilege access).
+- Use **AS2 or SFTP** via clearinghouse/partner for transport.
 """)
