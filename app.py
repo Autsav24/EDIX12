@@ -33,7 +33,7 @@ def normalize_punctuation(text: str) -> str:
 tab_build, tab_parse, tab_help = st.tabs(["Build 270", "Parse 271", "Help & Notes"])
 
 # =========================
-# Build 270 (profile-aware)
+# Build 270 (profile-aware, with PRV + N3/N4)
 # =========================
 with tab_build:
     st.subheader("Build a 270 Request")
@@ -50,7 +50,6 @@ with tab_build:
         subscriber_id = st.text_input("Subscriber Member ID", value="W123456789")
         trn_trace = st.text_input("TRN Trace (optional)", value="TRACE12345")
     with colC:
-        # Profile’s preferred EQ as default selection
         default_eq = PAYER_PROFILES[profile_key].get("preferred_eq", ["30"])
         service_types = st.multiselect(
             "Service Type Codes (EQ)",
@@ -62,18 +61,37 @@ with tab_build:
         ranged = st.checkbox("Use Date Range (RD8)", value=True)
         dt_end = st.date_input("Eligibility End", datetime.today().date() + timedelta(days=30)) if ranged else None
 
+    with st.expander("Provider Details (PRV + Address)"):
+        prof = PAYER_PROFILES[profile_key]
+        include_prv = st.checkbox("Include PRV (taxonomy)", value=prof.get("include_prv", False))
+        provider_taxonomy = st.text_input("Provider Taxonomy (PRV03)", value=prof.get("provider_taxonomy",""))
+        include_addresses = st.checkbox("Include Addresses (N3/N4)", value=prof.get("include_addresses", False))
+
+        st.caption("Provider Address (optional)")
+        p_line1 = st.text_input("Provider Address Line 1", value="")
+        p_line2 = st.text_input("Provider Address Line 2", value="")
+        p_city  = st.text_input("Provider City", value="")
+        p_state = st.text_input("Provider State (2-letter)", value="")
+        p_zip   = st.text_input("Provider ZIP", value="")
+
+    with st.expander("Subscriber Demographics & Address"):
+        require_dmg = PAYER_PROFILES[profile_key].get("require_dmg", False)
+        dmg_dob = st.text_input("DOB (YYYYMMDD)", value="19800101" if require_dmg else "")
+        dmg_gender = st.selectbox("Gender", ["", "M", "F", "U"], index=0 if not require_dmg else 3)
+
+        st.caption("Subscriber Address (optional, used if 'Include Addresses' is checked)")
+        s_line1 = st.text_input("Subscriber Address Line 1", value="")
+        s_line2 = st.text_input("Subscriber Address Line 2", value="")
+        s_city  = st.text_input("Subscriber City", value="")
+        s_state = st.text_input("Subscriber State (2-letter)", value="")
+        s_zip   = st.text_input("Subscriber ZIP", value="")
+
     # Optional dependent
     with st.expander("Dependent (optional)"):
         use_dependent = st.checkbox("Query Dependent?", value=False)
         dep_last = st.text_input("Dependent Last Name", value="") if use_dependent else ""
         dep_first = st.text_input("Dependent First Name", value="") if use_dependent else ""
         dep_id = st.text_input("Dependent ID", value="") if use_dependent else ""
-
-    # Optional DMG (DOB/Gender)
-    with st.expander("Subscriber Demographics (DMG)"):
-        require_dmg = PAYER_PROFILES[profile_key].get("require_dmg", False)
-        dmg_dob = st.text_input("DOB (YYYYMMDD)", value="19800101" if require_dmg else "")
-        dmg_gender = st.selectbox("Gender", ["", "M", "F", "U"], index=0 if not require_dmg else 3)
 
     if st.button("Generate 270"):
         profile = PAYER_PROFILES[profile_key]
@@ -82,6 +100,9 @@ with tab_build:
         dependent = None
         if use_dependent:
             dependent = Party(last=dep_last, first=dep_first, id_code=dep_id, id_qual=profile.get("id_qual","MI"))
+
+        prov_addr = {"line1": p_line1, "line2": p_line2, "city": p_city, "state": p_state, "zip": p_zip}
+        subs_addr = {"line1": s_line1, "line2": s_line2, "city": s_city, "state": s_state, "zip": s_zip}
 
         edi270 = build_270(
             isa_ctrl=1, gs_ctrl=1, st_ctrl=1,
@@ -96,6 +117,11 @@ with tab_build:
             trn_trace=trn_trace if profile.get("expect_trn") else None,
             dmg_dob=dmg_dob or None,
             dmg_gender=dmg_gender or None,
+            include_prv=include_prv,
+            provider_taxonomy=provider_taxonomy,
+            include_addresses=include_addresses,
+            provider_addr=prov_addr if any(prov_addr.values()) else None,
+            subscriber_addr=subs_addr if any(subs_addr.values()) else None,
         )
 
         st.write("### Generated 270")
@@ -192,14 +218,13 @@ with tab_parse:
 with tab_help:
     st.markdown("""
 ### Profiles & universality
-This app includes a **profile system** so you can tune small differences per payer/clearinghouse:
+Use **profiles** (in `edi_x12.PAYER_PROFILES`) to tune small differences per payer:
 - preferred `EQ` codes
 - whether `DMG` is required
 - whether to include `TRN`
 - ID qualifiers (`MI`, etc.)
 - extra `REF` segments (e.g., `REF*6P`)
-
-Add or edit profiles in `edi_x12.PAYER_PROFILES`.
+- include **PRV** (taxonomy) and **addresses (N3/N4)** when required
 
 ### EB interpretation
 We capture a broad EB shape and provide a **heuristic summary** (Active, Copay, Coinsurance, Deductible).
