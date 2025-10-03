@@ -3,23 +3,20 @@ import io
 import zipfile
 import streamlit as st
 from datetime import datetime, timedelta
-from edi_x12 import Provider, Party, build_270, parse_271, ServiceTypeMap
+from edi_x12 import (
+    Provider, Party, build_270, parse_271, ServiceTypeMap,
+    PAYER_PROFILES, normalize_eb_for_reporting
+)
 
-st.set_page_config(page_title="X12 EDI – 270/271", page_icon="📡", layout="wide")
-st.title("📡 X12 EDI – 270/271 Eligibility (MVP)")
+st.set_page_config(page_title="X12 EDI – 270/271 (Profiles)", page_icon="📡", layout="wide")
+st.title("📡 X12 EDI – 270/271 (Profile-ready MVP)")
 
-# --------- Robust decoder (fixes cp1252 0x96 etc.) ----------
+# --------- Robust decoder (fixes Windows-1252 0x96 etc.) ----------
 def robust_decode(raw: bytes) -> str:
-    """
-    Decode X12 text from common encodings.
-    Prioritizes cp1252 because 0x96 (–) is common in Windows-encoded files.
-    Falls back to 'replace' to avoid hard crashes.
-    """
     if raw.startswith(b"%PDF"):
         raise ValueError("Not a plain-text X12 file (PDF detected).")
     if raw[:2] == b"\x1f\x8b":
-        raise ValueError("GZIP detected. Please upload the uncompressed X12 file or a ZIP.")
-
+        raise ValueError("GZIP detected. Upload uncompressed X12 or a ZIP containing it.")
     for enc in ("cp1252", "utf-8", "utf-8-sig", "latin-1"):
         try:
             return raw.decode(enc)
@@ -36,40 +33,55 @@ def normalize_punctuation(text: str) -> str:
 tab_build, tab_parse, tab_help = st.tabs(["Build 270", "Parse 271", "Help & Notes"])
 
 # =========================
-# Build 270
+# Build 270 (profile-aware)
 # =========================
 with tab_build:
     st.subheader("Build a 270 Request")
 
-    col1, col2 = st.columns(2)
-    with col1:
+    colA, colB, colC = st.columns([1,1,1])
+    with colA:
+        profile_key = st.selectbox("Payer Profile", options=list(PAYER_PROFILES.keys()), index=0)
         payer_id = st.text_input("Payer ID (PI)", value="12345")
         prov_name = st.text_input("Provider Name", value="Buddha Clinic")
         npi = st.text_input("Provider NPI", value="1234567890")
-
+    with colB:
         subscriber_last = st.text_input("Subscriber Last Name", value="DOE")
         subscriber_first = st.text_input("Subscriber First Name", value="JOHN")
-        subscriber_id = st.text_input("Subscriber Member ID (MI)", value="W123456789")
-    with col2:
+        subscriber_id = st.text_input("Subscriber Member ID", value="W123456789")
+        trn_trace = st.text_input("TRN Trace (optional)", value="TRACE12345")
+    with colC:
+        # Profile’s preferred EQ as default selection
+        default_eq = PAYER_PROFILES[profile_key].get("preferred_eq", ["30"])
         service_types = st.multiselect(
             "Service Type Codes (EQ)",
             options=list(ServiceTypeMap.keys()),
-            default=["30"],
+            default=default_eq,
             format_func=lambda x: f"{x} – {ServiceTypeMap.get(x,'')}"
         )
         dt_start = st.date_input("Eligibility Start", datetime.today().date())
         ranged = st.checkbox("Use Date Range (RD8)", value=True)
         dt_end = st.date_input("Eligibility End", datetime.today().date() + timedelta(days=30)) if ranged else None
 
+    # Optional dependent
+    with st.expander("Dependent (optional)"):
         use_dependent = st.checkbox("Query Dependent?", value=False)
         dep_last = st.text_input("Dependent Last Name", value="") if use_dependent else ""
         dep_first = st.text_input("Dependent First Name", value="") if use_dependent else ""
-        dep_id = st.text_input("Dependent ID (if required)", value="") if use_dependent else ""
+        dep_id = st.text_input("Dependent ID", value="") if use_dependent else ""
+
+    # Optional DMG (DOB/Gender)
+    with st.expander("Subscriber Demographics (DMG)"):
+        require_dmg = PAYER_PROFILES[profile_key].get("require_dmg", False)
+        dmg_dob = st.text_input("DOB (YYYYMMDD)", value="19800101" if require_dmg else "")
+        dmg_gender = st.selectbox("Gender", ["", "M", "F", "U"], index=0 if not require_dmg else 3)
 
     if st.button("Generate 270"):
+        profile = PAYER_PROFILES[profile_key]
         provider = Provider(name=prov_name, npi=npi)
-        subscriber = Party(last=subscriber_last, first=subscriber_first, id_code=subscriber_id)
-        dependent = Party(last=dep_last, first=dep_first, id_code=dep_id) if use_dependent else None
+        subscriber = Party(last=subscriber_last, first=subscriber_first, id_code=subscriber_id, id_qual=profile.get("id_qual","MI"))
+        dependent = None
+        if use_dependent:
+            dependent = Party(last=dep_last, first=dep_first, id_code=dep_id, id_qual=profile.get("id_qual","MI"))
 
         edi270 = build_270(
             isa_ctrl=1, gs_ctrl=1, st_ctrl=1,
@@ -80,6 +92,10 @@ with tab_build:
             service_types=service_types,
             date_start=dt_start.strftime("%Y%m%d"),
             date_end=dt_end.strftime("%Y%m%d") if ranged and dt_end else None,
+            profile=profile,
+            trn_trace=trn_trace if profile.get("expect_trn") else None,
+            dmg_dob=dmg_dob or None,
+            dmg_gender=dmg_gender or None,
         )
 
         st.write("### Generated 270")
@@ -101,7 +117,7 @@ with tab_parse:
     if uploaded:
         raw = uploaded.read()
 
-        # If it's a ZIP, open first file inside
+        # ZIP support (take first file)
         if uploaded.name.lower().endswith(".zip"):
             try:
                 with zipfile.ZipFile(io.BytesIO(raw)) as zf:
@@ -120,7 +136,6 @@ with tab_parse:
 
         parsed = parse_271(content)
 
-        # Debug info
         with st.expander("🔎 Debug parser info"):
             dbg = parsed.get("_debug", {})
             st.write({
@@ -130,6 +145,9 @@ with tab_parse:
                 "first_tags": dbg.get("first_tags"),
             })
             st.code(content[:400].replace("\r", "\\r").replace("\n", "\\n\n"))
+
+        if parsed.get("_validation"):
+            st.warning("Validation: " + "; ".join(parsed["_validation"]))
 
         st.write("### Payer")
         st.json(parsed.get("payer", {}))
@@ -147,6 +165,8 @@ with tab_parse:
         st.write("### Benefit (EB) Segments")
         if parsed.get("eb"):
             st.dataframe(parsed["eb"], use_container_width=True)
+            st.write("### Quick Summary (heuristic)")
+            st.json(normalize_eb_for_reporting(parsed["eb"]))
         else:
             st.info("No EB segments found. Check AAA segments or try service type EQ=30.")
 
@@ -171,18 +191,23 @@ with tab_parse:
 # =========================
 with tab_help:
     st.markdown("""
-### How this MVP works
-- **Build 270**: Creates a simple eligibility request with ISA/GS/ST envelopes, payer (NM1*PR), provider (NM1*1P),
-  subscriber (NM1*IL) and optional dependent (NM1*QD), date (DTP*291), and service types (EQ).
-- **Parse 271**: Pragmatically parses NM1 (payer/provider/subscriber/dependent), EB (benefits), AAA (rejections),
-  and surfaces REF/DTP segments. Companion guides vary; extend as needed.
+### Profiles & universality
+This app includes a **profile system** so you can tune small differences per payer/clearinghouse:
+- preferred `EQ` codes
+- whether `DMG` is required
+- whether to include `TRN`
+- ID qualifiers (`MI`, etc.)
+- extra `REF` segments (e.g., `REF*6P`)
 
-### Tips
-- If a payer returns **no EB**, try **EQ = 30** (general plan coverage).
-- Ensure unique control numbers (`ISA13`, `GS06`, `ST02`) in production (store counters in DB).
-- Follow each trading partner's **companion guide** for exact REF/TRN/DMG rules.
+Add or edit profiles in `edi_x12.PAYER_PROFILES`.
 
-### Security (when you go beyond testing)
-- Treat member data as **PHI**; store securely (e.g., Postgres with encryption, least-privilege access).
-- Use **AS2 or SFTP** via clearinghouse/partner for transport.
+### EB interpretation
+We capture a broad EB shape and provide a **heuristic summary** (Active, Copay, Coinsurance, Deductible).
+For production, extend the mapping per payer's companion guide.
+
+### Validation
+We include a light ST/SE count check and basic envelope warnings to catch common formatting issues.
+
+### Security
+Treat member data as PHI. Store/process securely and use AS2/SFTP for transport in production.
 """)
