@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Tuple, Dict, Optional
 
-# ---------- Defaults ----------
+# ---------------- Defaults & Maps ----------------
 DEFAULT_SEG = "~"
 DEFAULT_ELEM = "*"
 DEFAULT_SUBELEM = ":"
@@ -28,30 +28,46 @@ ServiceTypeMap = {
     "98": "Professional (Physician)",
 }
 
-# ---------- Delimiter utilities ----------
+# ---------------- Payer Profiles (extend per payer) ----------------
+PAYER_PROFILES: Dict[str, Dict] = {
+    "default": {
+        "preferred_eq": ["30"],
+        "require_dmg": False,             # require DOB/Gender in 270
+        "expect_trn": True,               # include TRN trace in 270
+        "id_qual": "MI",                  # subscriber/dependent ID qualifier
+        "subscriber_is_primary": True,
+        "extra_ref": [],                  # e.g., ["6P"] (provider network ID)
+    },
+    "ACME_HEALTH_12345": {
+        "preferred_eq": ["30"],
+        "require_dmg": True,
+        "expect_trn": True,
+        "id_qual": "MI",
+        "subscriber_is_primary": True,
+        "extra_ref": ["6P"],
+    },
+}
+
+# ---------------- Delimiter utils ----------------
 def detect_delimiters(edi_text: str) -> Tuple[str, str, str]:
     """
-    Robust delimiter detection from ISA:
+    From ISA:
       - element separator at index 3
       - component separator at index 104 (ISA16, 0-based)
-      - segment terminator char immediately after fixed-length ISA (index 105)
-    Fallback: if few '~' but many newlines, use '\n' as segment terminator.
+      - segment terminator at index 105
+    Fallback: if few seg chars but many newlines, use '\n'.
     """
     seg = DEFAULT_SEG
     elem = DEFAULT_ELEM
     comp = DEFAULT_SUBELEM
-
     if edi_text.startswith("ISA") and len(edi_text) >= 106:
         elem = edi_text[3]
         if len(edi_text) > 104:
             comp = edi_text[104]
         if len(edi_text) > 105:
             seg = edi_text[105]
-
-    # Newline-terminated files fallback
     if edi_text.count(seg) < 2 and edi_text.count("\n") >= 2:
         seg = "\n"
-
     return seg, elem, comp
 
 def ensure_seg_terminated(text: str, seg_t: str) -> str:
@@ -59,10 +75,6 @@ def ensure_seg_terminated(text: str, seg_t: str) -> str:
     return t if t.endswith(seg_t) else (t + seg_t)
 
 def split_segments(edi_text: str, seg_t: str) -> List[str]:
-    """
-    Split by detected segment terminator, trimming empties.
-    If terminator is newline, tolerate both \r\n and \n.
-    """
     text = edi_text.strip()
     if seg_t == "\n":
         parts = [p.strip() for p in text.replace("\r\n", "\n").split("\n")]
@@ -75,11 +87,10 @@ def split_segments(edi_text: str, seg_t: str) -> List[str]:
 def parse_segments(edi_text: str, seg_t: str, elem_t: str) -> List[List[str]]:
     return [seg.split(elem_t) for seg in split_segments(edi_text, seg_t)]
 
-# ---------- Envelopes ----------
+# ---------------- Envelopes ----------------
 def build_ISA(control_num: int, sender_id: str, receiver_id: str,
               elem_t: str = DEFAULT_ELEM, seg_t: str = DEFAULT_SEG) -> str:
     now = datetime.utcnow()
-    # Simplified ISA for demo purposes (qualifiers 'ZZ', repetition sep '^').
     return elem_t.join([
         "ISA","00","" * 10,"00","" * 10,"ZZ",sender_id.ljust(15),
         "ZZ",receiver_id.ljust(15),
@@ -110,21 +121,21 @@ def build_SE(control_num: int, segment_count: int,
              elem_t: str = DEFAULT_ELEM, seg_t: str = DEFAULT_SEG) -> str:
     return elem_t.join(["SE", str(segment_count), f"{control_num:09d}"]) + seg_t
 
-# ---------- Business objects ----------
+# ---------------- Business objects ----------------
 @dataclass
 class Party:
     last: str
     first: str = ""
     middle: str = ""
-    id_code: str = ""   # e.g., Member ID
-    id_qual: str = "MI" # Member Identification Number
+    id_code: str = ""
+    id_qual: str = "MI"
 
 @dataclass
 class Provider:
     name: str
     npi: str
 
-# ---------- 270 Builder (single sub/dependent) ----------
+# ---------------- 270 Builder (profile-aware) ----------------
 def build_270(
     isa_ctrl: int,
     gs_ctrl: int,
@@ -133,81 +144,122 @@ def build_270(
     provider: Provider,
     subscriber: Party,
     dependent: Optional[Party],
-    service_types: List[str],  # e.g., ["30"]
-    date_start: str,           # YYYYMMDD
-    date_end: Optional[str] = None,
+    service_types: List[str],
+    date_start: str,                  # YYYYMMDD
+    date_end: Optional[str] = None,   # YYYYMMDD
+    profile: Dict = None,
+    trn_trace: Optional[str] = None,
+    dmg_dob: Optional[str] = None,    # YYYYMMDD
+    dmg_gender: Optional[str] = None, # M/F/U
     elem_t: str = DEFAULT_ELEM,
     seg_t: str = DEFAULT_SEG,
 ) -> str:
+    prof = profile or PAYER_PROFILES["default"]
     segs: List[str] = []
 
-    # Envelope
     segs.append(build_ISA(isa_ctrl, sender_id="SENDERID", receiver_id="RECEIVERID", elem_t=elem_t, seg_t=seg_t))
     segs.append(build_GS(gs_ctrl, sender_code="SENDER", receiver_code="RECEIVER", elem_t=elem_t, seg_t=seg_t))
     segs.append(build_ST(st_ctrl, elem_t=elem_t, seg_t=seg_t))
 
-    # BHT – generic
     segs.append(elem_t.join(["BHT","0022","13", f"CN{st_ctrl}", datetime.utcnow().strftime("%Y%m%d"), datetime.utcnow().strftime("%H%M")]) + seg_t)
 
-    # 2100A Payer (HL 1)
-    segs.append(elem_t.join(["HL","1","","20","1"]) + seg_t)  # Info Source, has child
+    # 2100A Payer
+    segs.append(elem_t.join(["HL","1","","20","1"]) + seg_t)
     segs.append(elem_t.join(["NM1","PR","2","PAYER NAME","","","", "PI", payer_id]) + seg_t)
 
-    # 2100B Provider (HL 2)
-    segs.append(elem_t.join(["HL","2","1","21","1"]) + seg_t)  # Info Receiver, has child
+    # 2100B Provider
+    segs.append(elem_t.join(["HL","2","1","21","1"]) + seg_t)
     segs.append(elem_t.join(["NM1","1P","2",provider.name,"","","","XX",provider.npi]) + seg_t)
 
-    # 2100C Subscriber (HL 3)
-    segs.append(elem_t.join(["HL","3","2","22","1" if dependent else "0"]) + seg_t)  # Subscriber
-    segs.append(elem_t.join(["NM1","IL","1",subscriber.last,subscriber.first,subscriber.middle,"",subscriber.id_qual,subscriber.id_code]) + seg_t)
-    # Demo DMG values—replace with real DOB/Gender if required by partner
-    segs.append(elem_t.join(["DMG","D8","19000101","U"]) + seg_t)
+    # Optional extra REF (per payer)
+    for ref in prof.get("extra_ref", []):
+        # Example value placeholder; set real values per partner
+        segs.append(elem_t.join(["REF", ref, "PLACEHOLDER"]) + seg_t)
 
-    # DTP (eligibility date or range)
+    # 2100C Subscriber
+    has_child = "1" if dependent else "0"
+    segs.append(elem_t.join(["HL","3","2","22",has_child]) + seg_t)
+    sub_id_qual = prof.get("id_qual","MI")
+    segs.append(elem_t.join(["NM1","IL","1",subscriber.last,subscriber.first,subscriber.middle,"",sub_id_qual,subscriber.id_code]) + seg_t)
+
+    # TRN trace (often required)
+    if prof.get("expect_trn") and trn_trace:
+        segs.append(elem_t.join(["TRN","2", trn_trace]) + seg_t)
+
+    # DMG if required or provided
+    if prof.get("require_dmg") or (dmg_dob or dmg_gender):
+        segs.append(elem_t.join([
+            "DMG","D8",
+            (dmg_dob or "19000101"),
+            (dmg_gender or "U")
+        ]) + seg_t)
+
+    # DTP date or range
     if date_end:
         segs.append(elem_t.join(["DTP","291","RD8", f"{date_start}-{date_end}"]) + seg_t)
     else:
         segs.append(elem_t.join(["DTP","291","D8", date_start]) + seg_t)
 
-    # 2100D Dependent (HL 4) if any
+    # 2100D Dependent
     if dependent:
+        dep_id_qual = prof.get("id_qual","MI")
         segs.append(elem_t.join(["HL","4","3","23","0"]) + seg_t)
-        segs.append(elem_t.join(["NM1","QD","1",dependent.last,dependent.first,dependent.middle,"",dependent.id_qual,dependent.id_code]) + seg_t)
+        segs.append(elem_t.join(["NM1","QD","1",dependent.last,dependent.first,dependent.middle,"",dep_id_qual,dependent.id_code]) + seg_t)
 
-    # EQ – service types
-    for stc in service_types:
+    # EQ service types (use profile defaults if none given)
+    eq_list = service_types or prof.get("preferred_eq", ["30"])
+    for stc in eq_list:
         segs.append(elem_t.join(["EQ", stc]) + seg_t)
 
-    # Count segments ST..SE inclusive
-    current_text = "".join(segs[2:])  # from ST onward (no SE yet)
-    seg_count = current_text.count(seg_t) + 1  # +1 for SE itself
-
+    # Segment count ST..SE
+    current_text = "".join(segs[2:])
+    seg_count = current_text.count(seg_t) + 1
     segs.append(build_SE(st_ctrl, seg_count, elem_t, seg_t))
     segs.append(build_GE(gs_ctrl, 1, elem_t, seg_t))
     segs.append(build_IEA(isa_ctrl, 1, elem_t, seg_t))
 
     return "".join(segs)
 
-# ---------- 271 Parser (with debug) ----------
+# ---------------- Validators ----------------
+def validate_envelopes(edi_text: str) -> List[str]:
+    """Light checks: ST/SE segment count, GE/IEA totals (best-effort)."""
+    warnings: List[str] = []
+    seg_t, elem_t, _ = detect_delimiters(edi_text)
+    segs = parse_segments(edi_text, seg_t, elem_t)
+
+    # ST/SE counts
+    st_idx = [i for i,s in enumerate(segs) if s and s[0].upper()=="ST"]
+    se_idx = [i for i,s in enumerate(segs) if s and s[0].upper()=="SE"]
+    for i, si in enumerate(st_idx):
+        if i >= len(se_idx):
+            warnings.append("SE segment missing for an ST.")
+            break
+        ei = se_idx[i]
+        between = segs[si:ei+1]
+        declared = 0
+        try:
+            declared = int(segs[ei][1])
+        except Exception:
+            warnings.append("SE01 missing or not integer.")
+        actual = len(between)
+        if declared and declared != actual:
+            warnings.append(f"SE01={declared} but counted {actual} segments between ST..SE.")
+
+    # GE/IEA minimal checks (counts are often 1 in MVP files)
+    # You can extend this to parse specific counts from GE/IEA and compare.
+
+    return warnings
+
+# ---------------- 271 Parser + post-processing ----------------
 def parse_271(edi_text: str) -> Dict:
     seg_t, elem_t, _ = detect_delimiters(edi_text)
-
-    # If no ISA and very few '~', assume newline-terminated records
     if "ISA" not in edi_text[:200] and seg_t == DEFAULT_SEG and edi_text.count(DEFAULT_SEG) < 2:
         seg_t = "\n"
-
     segs = parse_segments(edi_text, seg_t, elem_t)
 
     out: Dict = {
-        "payer": {},
-        "provider": {},
-        "subscriber": {},
-        "dependent": {},
-        "eb": [],    # benefits
-        "aaa": [],   # rejections
-        "trace": {}, # TRN
-        "dtp": [],   # date segments
-        "ref": [],   # references
+        "payer": {}, "provider": {}, "subscriber": {}, "dependent": {},
+        "eb": [], "aaa": [], "trace": {}, "dtp": [], "ref": [],
         "_debug": {
             "segment_terminator": repr(seg_t),
             "element_separator": repr(elem_t),
@@ -217,8 +269,7 @@ def parse_271(edi_text: str) -> Dict:
     }
 
     for parts in segs:
-        if not parts:
-            continue
+        if not parts: continue
         tag = parts[0].strip().upper()
 
         if tag == "NM1":
@@ -257,15 +308,24 @@ def parse_271(edi_text: str) -> Dict:
             }
 
         elif tag == "EB":
-            EB01 = parts[1] if len(parts) > 1 else ""
+            # Capture up to 13 positions commonly used
+            eb = {f"E{i:02d}": (parts[i] if len(parts) > i else "") for i in range(1, 14)}
+            # Friendly projection
             rec = {
-                "EB01": EB01,
-                "Coverage": EB01_MAP.get(EB01, ""),
-                "EB02": parts[2] if len(parts) > 2 else "",
-                "ServiceType": parts[3] if len(parts) > 3 else "",
-                "PlanDesc": parts[4] if len(parts) > 4 else "",
-                "TimePeriod": parts[5] if len(parts) > 5 else "",
-                "BenefitAmt": parts[6] if len(parts) > 6 else "",
+                "EB01": eb["E01"],
+                "Coverage": EB01_MAP.get(eb["E01"], ""),
+                "EB02": eb["E02"],
+                "ServiceType": eb["E03"],
+                "PlanDesc": eb["E04"],
+                "TimePeriod": eb["E05"],
+                "BenefitAmt": eb["E06"],  # often amount
+                "Percent": eb["E07"],     # if percent
+                "QtyQual": eb["E08"],
+                "Qty": eb["E09"],
+                "AuthInd": eb["E10"],
+                "InPlan": eb["E11"],
+                "Proc": eb["E12"],        # composite proc if present
+                "Raw": eb,
             }
             out["eb"].append(rec)
 
@@ -281,4 +341,33 @@ def parse_271(edi_text: str) -> Dict:
         elif tag == "REF":
             out["ref"].append(parts)
 
+    # Attach light validation warnings
+    out["_validation"] = validate_envelopes(edi_text)
     return out
+
+def normalize_eb_for_reporting(eb_rows: List[Dict]) -> Dict[str, Optional[str]]:
+    """
+    Heuristic mapper to pull commonly-needed fields.
+    This is intentionally light; refine per payer profile if needed.
+    """
+    summary = {
+        "Active": None,
+        "DeductibleRemaining": None,
+        "CoinsurancePercent": None,
+        "CopayAmount": None,
+        "InNetwork": None,
+    }
+    for r in eb_rows:
+        if r.get("EB01") == "1":
+            summary["Active"] = "Yes"
+        if "deduct" in (r.get("PlanDesc","") or "").lower():
+            amt = r.get("BenefitAmt") or r["Raw"].get("E06","")
+            if amt: summary["DeductibleRemaining"] = amt
+        if r.get("Percent"):
+            summary["CoinsurancePercent"] = r["Percent"]
+        if "copay" in (r.get("PlanDesc","") or "").lower():
+            amt = r.get("BenefitAmt") or r["Raw"].get("E06","")
+            if amt: summary["CopayAmount"] = amt
+        if r.get("InPlan"):
+            summary["InNetwork"] = "Yes" if r["InPlan"] == "Y" else ("No" if r["InPlan"] == "N" else None)
+    return summary
