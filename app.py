@@ -1,23 +1,29 @@
+﻿# app.py
+import io
+import zipfile
 import streamlit as st
 from datetime import datetime, timedelta
 from edi_x12 import (
     Provider, Party, build_270, parse_271, ServiceTypeMap
 )
 
-st.set_page_config(page_title="X12 EDI � 270/271", page_icon="??", layout="wide")
-st.title("?? X12 EDI � 270/271 Eligibility (MVP)")
+st.set_page_config(page_title="X12 EDI – 270/271", page_icon="📡", layout="wide")
+st.title("📡 X12 EDI – 270/271 Eligibility (MVP)")
 
 tab_build, tab_parse, tab_help = st.tabs(["Build 270", "Parse 271", "Help & Notes"])
 
-# ---------- Build 270 ----------
+# =========================
+# Build 270
+# =========================
 with tab_build:
     st.subheader("Build a 270 Request")
 
     col1, col2 = st.columns(2)
     with col1:
         payer_id = st.text_input("Payer ID (PI)", value="12345")
-        npi = st.text_input("Provider NPI", value="1234567890")
         prov_name = st.text_input("Provider Name", value="Buddha Clinic")
+        npi = st.text_input("Provider NPI", value="1234567890")
+
         subscriber_last = st.text_input("Subscriber Last Name", value="DOE")
         subscriber_first = st.text_input("Subscriber First Name", value="JOHN")
         subscriber_id = st.text_input("Subscriber Member ID (MI)", value="W123456789")
@@ -26,7 +32,7 @@ with tab_build:
             "Service Type Codes (EQ)",
             options=list(ServiceTypeMap.keys()),
             default=["30"],
-            format_func=lambda x: f"{x} � {ServiceTypeMap.get(x,'')}"
+            format_func=lambda x: f"{x} – {ServiceTypeMap.get(x,'')}"
         )
         dt_start = st.date_input("Eligibility Start", datetime.today().date())
         ranged = st.checkbox("Use Date Range (RD8)", value=True)
@@ -53,54 +59,121 @@ with tab_build:
             date_end=dt_end.strftime("%Y%m%d") if ranged and dt_end else None,
         )
 
+        st.write("### Generated 270")
         st.code(edi270, language="plain")
-        st.download_button("?? Download 270", data=edi270.encode("utf-8"),
-                           file_name=f"270_{subscriber_last}_{datetime.now().strftime('%Y%m%d%H%M')}.x12",
-                           mime="text/plain")
+        st.download_button(
+            "⬇️ Download 270",
+            data=edi270.encode("utf-8"),
+            file_name=f"270_{subscriber_last}_{datetime.now().strftime('%Y%m%d%H%M')}.x12",
+            mime="text/plain"
+        )
 
-# ---------- Parse 271 ----------
+# =========================
+# Parse 271
+# =========================
 with tab_parse:
     st.subheader("Parse a 271 Response")
 
-    uploaded = st.file_uploader("Upload 271 (text/X12)", type=["x12","edi","txt"])
+    uploaded = st.file_uploader("Upload 271 (text/X12 or ZIP)", type=["x12","edi","txt","dat","zip"])
     if uploaded:
-        content = uploaded.read().decode("utf-8", errors="ignore")
-        parsed = parse_271(content)
+        raw = uploaded.read()
+
+        # If it's a ZIP, open first file inside
+        if uploaded.name.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                    # pick the first file-like entry
+                    names = [n for n in zf.namelist() if not n.endswith("/")]
+                    if not names:
+                        st.error("ZIP has no files")
+                        st.stop()
+                    raw = zf.read(names[0])
+            except zipfile.BadZipFile:
+                st.error("Uploaded file looks like a ZIP but couldn't be opened.")
+                st.stop()
+
+        # Guard: PDFs uploaded by mistake
+        if raw[:4] == b"%PDF":
+            st.error("This appears to be a PDF, not a raw X12 271. Please upload the .x12/.edi text file.")
+            st.stop()
+
+        # Try decodings (handles cp1252 where 0x96 en-dash exists)
+        decoded = None
+        for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+            try:
+                decoded = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if decoded is None:
+            decoded = raw.decode("utf-8", errors="replace")
+
+        # Normalize some “smart” punctuation and non-breaking spaces
+        replacements = {
+            "\u2013": "-", "\u2014": "-",
+            "\u2018": "'", "\u2019": "'",
+            "\u201c": '"', "\u201d": '"',
+            "\u00a0": " ",
+        }
+        for k, v in replacements.items():
+            decoded = decoded.replace(k, v)
+
+        # Parse
+        parsed = parse_271(decoded)
+
         st.write("### Payer")
         st.json(parsed.get("payer", {}))
+
         st.write("### Provider")
         st.json(parsed.get("provider", {}))
+
         st.write("### Subscriber")
         st.json(parsed.get("subscriber", {}))
-        if parsed.get("dependent", {}):
+
+        if parsed.get("dependent"):
             st.write("### Dependent")
             st.json(parsed.get("dependent", {}))
 
         st.write("### Benefit (EB) Segments")
-        if parsed["eb"]:
+        if parsed.get("eb"):
             st.dataframe(parsed["eb"], use_container_width=True)
         else:
-            st.info("No EB segments found. Check AAA segments or payer�s companion guide requirements.")
+            st.info("No EB segments found. Check AAA segments or try service type EQ=30.")
 
-        if parsed["aaa"]:
+        if parsed.get("aaa"):
             st.write("### Rejections (AAA)")
             st.dataframe(parsed["aaa"], use_container_width=True)
 
-        st.write("### Raw 271")
-        st.code(content[:2000] + ("...\n" if len(content) > 2000 else ""), language="plain")
+        if parsed.get("dtp"):
+            st.write("### DTP (Dates)")
+            st.dataframe(parsed["dtp"], use_container_width=True)
 
-# ---------- Help ----------
+        if parsed.get("ref"):
+            st.write("### REF (References)")
+            st.dataframe(parsed["ref"], use_container_width=True)
+
+        st.write("### Raw 271 (first 2000 chars)")
+        preview = decoded[:2000] + ("...\n" if len(decoded) > 2000 else "")
+        st.code(preview, language="plain")
+
+# =========================
+# Help & Notes
+# =========================
 with tab_help:
     st.markdown("""
-### Notes & Next Steps
-- If a payer returns **no EB**, they may need different `EQ` (commonly `30`) or additional REF/NM1 values.
-- Control numbers (`ISA13`, `GS06`, `ST02`) must be unique per interchange; persist counters in a DB and **rollover safely** at their max.
-- Add **TRN** and **REF** per trading partner�s guide, plus real demographics `DMG` (DOB/Gender).
-- For production:
-  - Store PHI only in secure DB (Postgres/Supabase/Neon). Encrypt at rest, restrict access.
-  - Transport via **AS2** or secure **SFTP** to clearinghouse/payer. Consider managed AS2 (Kiteworks, Axway, AWS Transfer + partner).
-  - Keep **message tracking**: Request ID, time, control nums, payer, status, file hashes.
-- Testing:
-  - Use payer/clearinghouse test endpoints and sample files from their companion guides.
-  - Validate segment counts (SE01), envelopes (IEA/GE totals).
+### How this MVP works
+- **Build 270**: Creates a simple eligibility request with ISA/GS/ST envelopes, payer (NM1*PR), provider (NM1*1P),
+  subscriber (NM1*IL) and optional dependent (NM1*QD), date (DTP*291), and one or more service types (EQ).
+- **Parse 271**: Pragmatically parses NM1 (payer/provider/subscriber/dependent), EB (benefits), AAA (rejections),
+  and surfaces REF/DTP segments. It does not fully implement every variation from payer companion guides.
+
+### Common tips
+- If a payer returns **no EB**, try service type **EQ=30** (many payers prefer this over **1**).
+- Ensure **control numbers** (ISA13/GS06/ST02) are unique in production; store counters in a DB.
+- Respect partner **companion guides** for exact qualifiers (REF/TRN/DMG), date rules, and loop usage.
+
+### Production notes
+- Persist requests/responses and counters in a secure DB (Postgres/Supabase/Neon).
+- Use secure transport (AS2/SFTP) via your clearinghouse or partner.
+- Treat all member data as PHI and follow HIPAA best practices.
 """)
