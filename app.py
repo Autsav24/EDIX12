@@ -1,7 +1,10 @@
 import streamlit as st
 from datetime import datetime, timedelta
+from io import BytesIO
+import pandas as pd
 from edi_x12 import Provider, Party, build_270, parse_271, ServiceTypeMap, normalize_eb_for_reporting
 
+# ================== APP CONFIG ==================
 st.set_page_config(page_title="X12 EDI Generator (270/271/835/837)", page_icon="📡", layout="wide")
 st.title("📡 X12 EDI Utility – 270 / 271 / 835 / 837")
 
@@ -128,6 +131,7 @@ with tab_270:
             dmg_gender=dmg_gender or None
         )
 
+        st.write("### Generated 270 EDI File")
         st.code(edi270, language="plain")
         st.download_button("⬇️ Download 270", data=edi270.encode("utf-8"), file_name="270.x12", mime="text/plain", key="download_270")
 
@@ -157,10 +161,11 @@ with tab_837:
 
     if st.button("Generate 837", key="btn_837"):
         edi837 = build_837(1, 1, 1000, sender, receiver, provider_npi, patient_name, patient_id, claim_id, claim_amount, dos_start, dos_end or None)
+        st.write("### Generated 837 EDI File")
         st.code(edi837, language="plain")
         st.download_button("⬇️ Download 837", data=edi837.encode("utf-8"), file_name="837.x12", mime="text/plain", key="download_837")
 
-# ================== 835 BUILDER ==================
+# ================== 835 BUILDER WITH EXCEL ==================
 with tab_835:
     st.subheader("💰 Build 835 – Remittance Advice")
     payer = st.text_input("Payer Name", "Insurance Co", key="payer_835")
@@ -174,5 +179,47 @@ with tab_835:
 
     if st.button("Generate 835", key="btn_835"):
         edi835 = build_835(1, 1, 1000, payer, payer_id, provider_npi, claim, patient, paid, chk, pdate)
+        st.write("### Generated 835 EDI File")
         st.code(edi835, language="plain")
-        st.download_button("⬇️ Download 835", data=edi835.encode("utf-8"), file_name="835.x12", mime="text/plain", key="download_835")
+
+        # Download EDI file
+        st.download_button(
+            "⬇️ Download 835 EDI",
+            data=edi835.encode("utf-8"),
+            file_name=f"835_{claim}.x12",
+            mime="text/plain",
+            key="download_835_edi"
+        )
+
+        # Create Excel summary
+        data = [{
+            "Payer Name": payer,
+            "Payer ID": payer_id,
+            "Provider NPI": provider_npi,
+            "Claim ID": claim,
+            "Patient Name": patient,
+            "Paid Amount": paid,
+            "Check Number": chk,
+            "Payment Date": pdate,
+            "Generated On": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }]
+        df = pd.DataFrame(data)
+
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            df.to_excel(writer, index=False, sheet_name="835 Summary")
+            worksheet = writer.sheets["835 Summary"]
+            for i, col in enumerate(df.columns):
+                worksheet.set_column(i, i, 20)
+        output.seek(0)
+
+        # Excel download
+        st.download_button(
+            "⬇️ Download Excel Summary",
+            data=output,
+            file_name=f"835_{claim}_summary.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_835_excel"
+        )
+
+        st.success("✅ 835 EDI and Excel Summary generated successfully!")
