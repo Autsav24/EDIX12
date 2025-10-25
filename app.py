@@ -1,190 +1,205 @@
+# app.py
 import streamlit as st
+import pandas as pd
 from datetime import datetime, timedelta
 from io import BytesIO
-import pandas as pd
-from edi_x12 import Provider, Party, build_270, parse_271, ServiceTypeMap
+from edi_x12 import Provider, Party, build_270, parse_271
 
-# ================== CONFIG ==================
-st.set_page_config(page_title="X12 EDI Portal", page_icon="📡", layout="wide")
-st.title("📡 X12 EDI Utility – 270 / 271 / 835 / 837")
+st.set_page_config(page_title="X12 EDI Suite - 270/271/276/277/835/837", page_icon="📡", layout="wide")
+st.title("📡 X12 EDI Transaction Suite")
 
-# ================== BUILD 835 ==================
-def build_835(isa_ctrl, gs_ctrl, st_ctrl, payer_name, payer_id, provider_npi, claim_id, patient_name, paid_amount, check_number, payment_date):
+# ---------------------------------------------------------------------
+# Helper: 276 / 277 Builders and Parsers
+# ---------------------------------------------------------------------
+def build_276(isa_ctrl, gs_ctrl, st_ctrl, payer_id, provider_name, provider_npi,
+              subscriber_last, subscriber_first, subscriber_id,
+              claim_control_number="", date_of_service=None):
     now = datetime.now()
+    dos = date_of_service or now.strftime("%Y%m%d")
+
     edi = ""
-    edi += f"ISA*00*          *00*          *ZZ*{payer_id:<15}*ZZ*RECEIVERID     *{now.strftime('%y%m%d')}*{now.strftime('%H%M')}*^*00501*{isa_ctrl:09d}*0*T*:~\n"
-    edi += f"GS*HP*{payer_id}*RECEIVER*{now.strftime('%Y%m%d')}*{now.strftime('%H%M')}*{gs_ctrl}*X*005010X221A1~\n"
-    edi += f"ST*835*{st_ctrl}*005010X221A1~\n"
-    edi += f"BPR*I*{paid_amount}*C*CHK*01*999999999*DA*123456789*{now.strftime('%Y%m%d')}~\n"
-    edi += f"TRN*1*{check_number}*{payer_id}~\n"
-    edi += f"DTM*405*{payment_date}~\n"
-    edi += f"N1*PR*{payer_name}*PI*{payer_id}~\n"
-    edi += f"N1*PE*BUDDHA CLINIC*XX*{provider_npi}~\n"
-    edi += f"CLP*{claim_id}*1*150*{paid_amount}**MC*{patient_name}*12*1~\n"
-    edi += "CAS*CO*45*50~\n"
-    edi += f"NM1*QC*1*{patient_name}****MI*123456789~\n"
-    edi += f"DTM*232*{payment_date}~\n"
-    edi += f"DTM*233*{payment_date}~\n"
+    edi += f"ISA*00*          *00*          *ZZ*SENDERID       *ZZ*RECEIVERID     *{now.strftime('%y%m%d')}*{now.strftime('%H%M')}*^*00501*{isa_ctrl:09d}*0*T*:~\n"
+    edi += f"GS*HN*SENDER*RECEIVER*{now.strftime('%Y%m%d')}*{now.strftime('%H%M')}*{gs_ctrl}*X*005010X212~\n"
+    edi += f"ST*276*{st_ctrl}*005010X212~\n"
+    edi += f"BHT*0010*13*{claim_control_number or st_ctrl}*{now.strftime('%Y%m%d')}*{now.strftime('%H%M')}~\n"
+    edi += "HL*1**20*1~\n"
+    edi += f"NM1*PR*2*PAYER NAME****PI*{payer_id}~\n"
+    edi += "HL*2*1*21*1~\n"
+    edi += f"NM1*41*2*{provider_name}*****XX*{provider_npi}~\n"
+    edi += "HL*3*2*19*0~\n"
+    edi += f"NM1*IL*1*{subscriber_last}*{subscriber_first}****MI*{subscriber_id}~\n"
+    edi += f"DTP*472*D8*{dos}~\n"
     edi += f"SE*12*{st_ctrl}~\n"
     edi += f"GE*1*{gs_ctrl}~\n"
     edi += f"IEA*1*{isa_ctrl:09d}~"
     return edi
 
-# ================== BUILD 837 ==================
-def build_837(isa_ctrl, gs_ctrl, st_ctrl, sender_id, receiver_id, provider_npi, patient_name, patient_id, claim_id, claim_amount, dos_start, dos_end=None):
+
+def parse_277(edi_text: str):
+    seg_t = "~"
+    if edi_text.count("~") < 2 and edi_text.count("\n") >= 2:
+        seg_t = "\n"
+    lines = [l.strip() for l in edi_text.replace("\r\n", "\n").split(seg_t) if l.strip()]
+    rows, current = [], {}
+    for line in lines:
+        parts = line.split("*")
+        tag = parts[0].upper()
+        if tag == "TRN":
+            current.setdefault("TraceNumber", parts[2] if len(parts) > 2 else "")
+        elif tag == "CLP":
+            if current:
+                rows.append(current)
+            current = {
+                "ClaimID": parts[1] if len(parts) > 1 else "",
+                "ClaimStatus": parts[2] if len(parts) > 2 else "",
+                "TotalCharge": parts[3] if len(parts) > 3 else "",
+                "TotalPaid": parts[4] if len(parts) > 4 else ""
+            }
+        elif tag == "STC":
+            current["StatusComposite"] = parts[1] if len(parts) > 1 else ""
+            current["StatusDate"] = parts[2] if len(parts) > 2 else ""
+        elif tag == "NM1" and len(parts) > 1 and parts[1] == "QC":
+            current["PatientLast"] = parts[3] if len(parts) > 3 else ""
+            current["PatientFirst"] = parts[4] if len(parts) > 4 else ""
+        elif tag == "DTP":
+            current.setdefault("Dates", []).append(parts[1:])
+    if current:
+        rows.append(current)
+    return pd.DataFrame(rows)
+
+# ---------------------------------------------------------------------
+# Helper: 837 & 835 (short versions)
+# ---------------------------------------------------------------------
+def build_837(payer_id, provider_npi, patient_name, patient_id, claim_id, amount):
     now = datetime.now()
-    dos_segment = f"DTP*472*D8*{dos_start}~" if not dos_end else f"DTP*472*RD8*{dos_start}-{dos_end}~"
-    edi = ""
-    edi += f"ISA*00*          *00*          *ZZ*{sender_id:<15}*ZZ*{receiver_id:<15}*{now.strftime('%y%m%d')}*{now.strftime('%H%M')}*^*00501*{isa_ctrl:09d}*0*T*:~\n"
-    edi += f"GS*HC*{sender_id}*{receiver_id}*{now.strftime('%Y%m%d')}*{now.strftime('%H%M')}*{gs_ctrl}*X*005010X222A1~\n"
-    edi += f"ST*837*{st_ctrl}*005010X222A1~\n"
-    edi += f"BHT*0019*00*{claim_id}*{now.strftime('%Y%m%d')}*{now.strftime('%H%M')}*CH~\n"
-    edi += "NM1*41*2*BUDDHA CLINIC*****46*12345~\n"
-    edi += "PER*IC*BILLING OFFICE*TE*8005551212~\n"
-    edi += "NM1*40*2*PAYER NAME*****46*99999~\n"
-    edi += "HL*1**20*1~\n"
-    edi += f"NM1*85*2*BUDDHA CLINIC*****XX*{provider_npi}~\n"
-    edi += "N3*123 MAIN STREET~\nN4*LUCKNOW*UP*226001~\n"
-    edi += "REF*EI*123456789~\n"
-    edi += "HL*2*1*22*0~\n"
-    edi += f"NM1*IL*1*{patient_name}****MI*{patient_id}~\n"
-    edi += dos_segment + "\n"
-    edi += f"CLM*{claim_id}*{claim_amount}***11:B:1*Y*A*Y*I~\n"
-    edi += "HI*BK:12345~\n"
-    edi += "LX*1~\n"
-    edi += "SV1*HC:99213*100*UN*1***1~\n"
-    edi += f"SE*20*{st_ctrl}~\n"
-    edi += f"GE*1*{gs_ctrl}~\n"
-    edi += f"IEA*1*{isa_ctrl:09d}~"
+    edi = f"""ISA*00**00**ZZ*SENDER*ZZ*RECEIVER*{now:%y%m%d}*{now:%H%M}*^*00501*000000001*0*T*:~
+GS*HC*SENDER*RECEIVER*{now:%Y%m%d}*{now:%H%M}*1*X*005010X222A1~
+ST*837*0001*005010X222A1~
+BHT*0019*00*{claim_id}*{now:%Y%m%d}*{now:%H%M}*CH~
+NM1*85*2*BUDDHA CLINIC*****XX*{provider_npi}~
+HL*1**20*1~
+NM1*IL*1*{patient_name}****MI*{patient_id}~
+CLM*{claim_id}*{amount}***11:B:1*Y*A*Y*I~
+SE*12*0001~
+GE*1*1~
+IEA*1*000000001~"""
     return edi
 
-# ================== TABS ==================
-tab_270, tab_271, tab_837, tab_835 = st.tabs(["270", "271", "837", "835"])
+def build_835(payer_name, payer_id, provider_npi, claim_id, patient_name, paid_amount):
+    now = datetime.now()
+    edi = f"""ISA*00**00**ZZ*{payer_id:<15}*ZZ*RECEIVER*{now:%y%m%d}*{now:%H%M}*^*00501*000000001*0*T*:~
+GS*HP*{payer_id}*RECEIVER*{now:%Y%m%d}*{now:%H%M}*1*X*005010X221A1~
+ST*835*0001*005010X221A1~
+BPR*I*{paid_amount}*C*CHK*01*999999999*DA*123456789*{now:%Y%m%d}~
+N1*PR*{payer_name}*PI*{payer_id}~
+N1*PE*BUDDHA CLINIC*XX*{provider_npi}~
+CLP*{claim_id}*1*150*{paid_amount}**MC*{patient_name}*12*1~
+SE*12*0001~
+GE*1*1~
+IEA*1*000000001~"""
+    return edi
 
-# ================== 270 ==================
-with tab_270:
-    st.subheader("🩺 Build 270 – Eligibility Inquiry")
-    payer_id = st.text_input("Payer ID (PI)", "12345", key="payer_270")
-    prov_name = st.text_input("Provider Name", "Buddha Clinic", key="prov_270")
-    npi = st.text_input("Provider NPI", "1234567890", key="npi_270")
-    subscriber_last = st.text_input("Subscriber Last Name", "DOE", key="sub_last_270")
-    subscriber_first = st.text_input("Subscriber First Name", "JOHN", key="sub_first_270")
-    subscriber_id = st.text_input("Subscriber Member ID", "W123456789", key="sub_id_270")
-    dmg_dob = st.text_input("Subscriber DOB (YYYYMMDD)", "19800101", key="dob_270")
-    dmg_gender = st.selectbox("Gender", ["", "M", "F"], index=1, key="gender_270")
-    dt_start = st.date_input("Eligibility Start", datetime.today().date(), key="start_270")
-    dt_end = st.date_input("Eligibility End", datetime.today().date() + timedelta(days=30), key="end_270")
+# ---------------------------------------------------------------------
+# TABS
+# ---------------------------------------------------------------------
+tabs = st.tabs(["270", "271", "276", "277", "837", "835"])
 
-    if st.button("Generate 270", key="btn_270"):
-        provider = Provider(name=prov_name, npi=npi)
-        subscriber = Party(last=subscriber_last, first=subscriber_first, id_code=subscriber_id)
-        edi270 = build_270(1, 1, 1000, payer_id, provider, subscriber, None, ["30"], dt_start.strftime("%Y%m%d"), dt_end.strftime("%Y%m%d"), dmg_dob, dmg_gender)
-        st.code(edi270, language="plain")
-        st.download_button("⬇️ Download 270", edi270.encode("utf-8"), "270.x12", key="dl_270")
+# ---------------- 270 ----------------
+with tabs[0]:
+    st.header("🩺 270 – Eligibility Inquiry")
+    payer_id = st.text_input("Payer ID", "12345", key="270_payer")
+    prov = st.text_input("Provider Name", "Buddha Clinic", key="270_prov")
+    npi = st.text_input("Provider NPI", "1234567890", key="270_npi")
+    sub_last = st.text_input("Subscriber Last Name", "DOE", key="270_last")
+    sub_first = st.text_input("Subscriber First Name", "JOHN", key="270_first")
+    sub_id = st.text_input("Subscriber ID", "W123456789", key="270_id")
+    dob = st.text_input("DOB (YYYYMMDD)", "19800101", key="270_dob")
+    gender = st.selectbox("Gender", ["", "M", "F"], key="270_gender")
+    date = st.date_input("Date of Service", datetime.today(), key="270_date")
 
-# ================== 271 ==================
-with tab_271:
-    st.subheader("📄 Parse 271 Response")
-    uploaded = st.file_uploader("Upload 271", type=["x12", "edi", "txt"], key="upload_271")
-    if uploaded:
-        content = uploaded.read().decode("utf-8", errors="ignore")
-        parsed = parse_271(content)
-        st.json(parsed)
-        st.download_button("⬇️ Download JSON", pd.DataFrame(parsed["eb"]).to_csv(index=False).encode(), "271_eb.csv", key="dl_271_csv")
+    if st.button("Generate 270", key="270_btn"):
+        provider = Provider(name=prov, npi=npi)
+        subscriber = Party(last=sub_last, first=sub_first, id_code=sub_id)
+        edi = build_270(1, 1, 1000, payer_id, provider, subscriber, None, ["30"], date.strftime("%Y%m%d"),
+                        None, dmg_dob=dob, dmg_gender=gender)
+        st.code(edi, language="plain")
+        st.download_button("⬇️ Download 270", data=edi.encode(), file_name="270_request.x12", key="270_dl")
 
-# ================== 837 ==================
-with tab_837:
-    st.subheader("📤 Build 837 – Professional Claim")
-    sender = st.text_input("Sender ID", "SENDERID", key="sender_837")
-    receiver = st.text_input("Receiver ID", "RECEIVERID", key="receiver_837")
-    provider_npi = st.text_input("Provider NPI", "1234567890", key="npi_837")
-    patient = st.text_input("Patient Name", "John Doe", key="patient_837")
-    pid = st.text_input("Patient ID", "W123456789", key="pid_837")
-    claim = st.text_input("Claim ID", "CLM1001", key="claim_837")
-    amt = st.text_input("Claim Amount", "150", key="amt_837")
-    dos_start = st.text_input("DOS Start (YYYYMMDD)", "20251025", key="dos_start_837")
-    dos_end = st.text_input("DOS End (YYYYMMDD)", "", key="dos_end_837")
-
-    if st.button("Generate 837", key="btn_837"):
-        edi837 = build_837(1, 1, 1000, sender, receiver, provider_npi, patient, pid, claim, amt, dos_start, dos_end or None)
-        st.code(edi837, language="plain")
-        st.download_button("⬇️ Download 837", edi837.encode("utf-8"), "837.x12", key="dl_837")
-
-# ================== 835 ==================
-with tab_835:
-    st.subheader("💰 Build 835 – Remittance Advice")
-    payer = st.text_input("Payer Name", "Insurance Co", key="payer_835")
-    payer_id = st.text_input("Payer ID", "12345", key="payerid_835")
-    provider_npi = st.text_input("Provider NPI", "1234567890", key="npi_835")
-    claim = st.text_input("Claim ID", "CLM1001", key="claim_835")
-    patient = st.text_input("Patient Name", "John Doe", key="patient_835")
-    paid = st.text_input("Paid Amount", "150", key="paid_835")
-    chk = st.text_input("Check Number", "CHK12345", key="chk_835")
-    pdate = st.text_input("Payment Date (YYYYMMDD)", datetime.today().strftime("%Y%m%d"), key="pdate_835")
-
-    if st.button("Generate 835", key="btn_835"):
-        edi835 = build_835(1, 1, 1000, payer, payer_id, provider_npi, claim, patient, paid, chk, pdate)
-        st.code(edi835, language="plain")
-        st.download_button("⬇️ Download 835", edi835.encode("utf-8"), "835.x12", key="dl_835")
-
-    # 📤 Parse 835
-    with st.expander("📤 Parse Existing 835 File to Excel", expanded=False):
-        uploaded_835 = st.file_uploader("Upload 835 (EDI/Text)", type=["835", "edi", "txt"], key="upload_835")
-        if uploaded_835:
-            raw = uploaded_835.read().decode("utf-8", errors="ignore")
-            lines = [seg.strip() for seg in raw.replace("~", "\n").splitlines() if seg.strip()]
-            payer, payee, check_info, claims = {}, {}, {}, []
-            current_claim = None
-
-            for line in lines:
-                parts = line.split("*")
-                tag = parts[0].upper()
-                if tag == "BPR":
-                    check_info["PaymentAmount"] = parts[2] if len(parts) > 2 else ""
-                    check_info["PaymentDate"] = parts[-1] if len(parts) > 10 else ""
-                elif tag == "TRN":
-                    check_info["CheckNumber"] = parts[2] if len(parts) > 2 else ""
-                elif tag == "N1":
-                    if len(parts) > 1 and parts[1] == "PR":
-                        payer["PayerName"] = parts[2]
-                        payer["PayerID"] = parts[-1]
-                    elif len(parts) > 1 and parts[1] == "PE":
-                        payee["PayeeName"] = parts[2]
-                        payee["NPI"] = parts[-1]
-                elif tag == "CLP":
-                    if current_claim:
-                        claims.append(current_claim)
-                    current_claim = {"ClaimID": parts[1], "TotalCharge": parts[3], "TotalPaid": parts[4]}
-                elif tag == "NM1" and len(parts) > 1 and parts[1] == "QC" and current_claim is not None:
-                    current_claim["PatientName"] = parts[3]
-                elif tag == "CAS" and current_claim is not None:
-                    current_claim["AdjustmentCode"] = parts[2]
-                    current_claim["AdjustmentAmt"] = parts[3]
-
-            if current_claim:
-                claims.append(current_claim)
-
-            if not claims:
-                st.warning("No CLP segments found.")
-                st.stop()
-
-            df = pd.DataFrame(claims)
-            df["PayerName"] = payer.get("PayerName", "")
-            df["PayeeName"] = payee.get("PayeeName", "")
-            df["CheckNumber"] = check_info.get("CheckNumber", "")
-            df["PaymentDate"] = check_info.get("PaymentDate", "")
-            df["PaymentAmount"] = check_info.get("PaymentAmount", "")
+# ---------------- 271 ----------------
+with tabs[1]:
+    st.header("📄 271 – Parse Eligibility Response")
+    file = st.file_uploader("Upload 271 File", type=["x12", "edi", "txt"], key="271_file")
+    if file:
+        text = file.read().decode("utf-8", errors="ignore")
+        result = parse_271(text)
+        st.json(result)
+        if "eb" in result and result["eb"]:
+            df = pd.DataFrame(result["eb"])
             st.dataframe(df, use_container_width=True)
 
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-                df.to_excel(writer, index=False, sheet_name="835_Claims")
-            output.seek(0)
+# ---------------- 276 ----------------
+with tabs[2]:
+    st.header("📨 276 – Claim Status Inquiry")
+    payer_id = st.text_input("Payer ID", "12345", key="276_payer")
+    prov_name = st.text_input("Provider Name", "Buddha Clinic", key="276_prov")
+    prov_npi = st.text_input("Provider NPI", "1234567890", key="276_npi")
+    sub_last = st.text_input("Subscriber Last", "DOE", key="276_last")
+    sub_first = st.text_input("Subscriber First", "JOHN", key="276_first")
+    sub_id = st.text_input("Subscriber ID", "W123456789", key="276_subid")
+    claim_ctrl = st.text_input("Claim Control Number", "", key="276_claim")
+    dos = st.text_input("Date of Service (YYYYMMDD)", datetime.today().strftime("%Y%m%d"), key="276_dos")
 
-            st.download_button(
-                "⬇️ Download Excel",
-                data=output,
-                file_name="835_summary.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_835_excel"
-            )
+    if st.button("Generate 276", key="276_btn"):
+        edi276 = build_276(1, 1, 1000, payer_id, prov_name, prov_npi, sub_last, sub_first, sub_id, claim_ctrl, dos)
+        st.code(edi276, language="plain")
+        st.download_button("⬇️ Download 276", data=edi276.encode(), file_name="276_request.x12", key="276_dl")
+
+# ---------------- 277 ----------------
+with tabs[3]:
+    st.header("📬 277 – Parse Claim Status Response")
+    file = st.file_uploader("Upload 277 File", type=["x12", "edi", "txt"], key="277_file")
+    if file:
+        text = file.read().decode("utf-8", errors="ignore")
+        df = parse_277(text)
+        if df.empty:
+            st.warning("No claims found in file.")
+        else:
+            st.dataframe(df, use_container_width=True)
+            out = BytesIO()
+            with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
+                df.to_excel(writer, index=False, sheet_name="277_Parsed")
+            out.seek(0)
+            st.download_button("⬇️ Download 277 Excel", out, file_name="277_parsed.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="277_dl")
+
+# ---------------- 837 ----------------
+with tabs[4]:
+    st.header("📤 837 – Professional Claim")
+    payer_id = st.text_input("Payer ID", "12345", key="837_payer")
+    npi = st.text_input("Provider NPI", "1234567890", key="837_npi")
+    patient = st.text_input("Patient Name", "John Doe", key="837_patient")
+    pid = st.text_input("Patient ID", "W123456789", key="837_pid")
+    claim = st.text_input("Claim ID", "CLM1001", key="837_claim")
+    amt = st.text_input("Amount", "150", key="837_amt")
+
+    if st.button("Generate 837", key="837_btn"):
+        edi837 = build_837(payer_id, npi, patient, pid, claim, amt)
+        st.code(edi837, language="plain")
+        st.download_button("⬇️ Download 837", data=edi837.encode(), file_name="837_claim.x12", key="837_dl")
+
+# ---------------- 835 ----------------
+with tabs[5]:
+    st.header("💰 835 – Payment / Remittance")
+    payer_name = st.text_input("Payer Name", "Insurance Co", key="835_payer")
+    payer_id = st.text_input("Payer ID", "12345", key="835_pid")
+    prov_npi = st.text_input("Provider NPI", "1234567890", key="835_npi")
+    claim = st.text_input("Claim ID", "CLM1001", key="835_claim")
+    patient = st.text_input("Patient Name", "John Doe", key="835_patient")
+    amt = st.text_input("Paid Amount", "150", key="835_amt")
+
+    if st.button("Generate 835", key="835_btn"):
+        edi835 = build_835(payer_name, payer_id, prov_npi, claim, patient, amt)
+        st.code(edi835, language="plain")
+        st.download_button("⬇️ Download 835", data=edi835.encode(), file_name="835_remit.x12", key="835_dl")
+
+st.caption("© 2025 Buddha Clinic EDI Suite")
