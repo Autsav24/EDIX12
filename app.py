@@ -37,10 +37,6 @@ def load_profiles() -> dict:
             pass
     return base
 
-def save_profiles(profiles: dict) -> None:
-    with open(PROFILES_FILE, "w", encoding="utf-8") as f:
-        json.dump(profiles, f, indent=2, ensure_ascii=False)
-
 if "profiles" not in st.session_state:
     st.session_state.profiles = load_profiles()
 
@@ -60,7 +56,7 @@ def robust_decode(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
 
 # ======================================================
-# Additional Transaction Builders & Parsers
+# 276 / 277
 # ======================================================
 def build_276(isa_ctrl, gs_ctrl, st_ctrl, payer_id, provider_name, provider_npi,
               subscriber_last, subscriber_first, subscriber_id,
@@ -84,7 +80,6 @@ def build_276(isa_ctrl, gs_ctrl, st_ctrl, payer_id, provider_name, provider_npi,
         f"IEA*1*{isa_ctrl:09d}~"
     )
     return edi
-
 
 def parse_277(edi_text: str):
     seg_t = "~"
@@ -118,7 +113,9 @@ def parse_277(edi_text: str):
         rows.append(current)
     return pd.DataFrame(rows)
 
-
+# ======================================================
+# 837 / 835
+# ======================================================
 def build_837(payer_id, provider_npi, patient_name, patient_id, claim_id, amount):
     now = datetime.now()
     return f"""ISA*00**00**ZZ*SENDER*ZZ*RECEIVER*{now:%y%m%d}*{now:%H%M}*^*00501*000000001*0*T*:~
@@ -133,7 +130,6 @@ SE*12*0001~
 GE*1*1~
 IEA*1*000000001~"""
 
-
 def build_835(payer_name, payer_id, provider_npi, claim_id, patient_name, paid_amount):
     now = datetime.now()
     return f"""ISA*00**00**ZZ*{payer_id:<15}*ZZ*RECEIVER*{now:%y%m%d}*{now:%H%M}*^*00501*000000001*0*T*:~
@@ -147,7 +143,6 @@ SE*12*0001~
 GE*1*1~
 IEA*1*000000001~"""
 
-
 def parse_835_to_df(edi_text: str):
     seg_t = "~"
     if edi_text.count("~") < 2 and edi_text.count("\n") >= 2:
@@ -155,7 +150,6 @@ def parse_835_to_df(edi_text: str):
     lines = [l.strip() for l in edi_text.replace("\r\n", "\n").split(seg_t) if l.strip()]
     payer, payee, claims, check = {}, {}, [], {}
     current = None
-
     for line in lines:
         parts = line.split("*")
         tag = parts[0].upper()
@@ -197,14 +191,12 @@ def parse_835_to_df(edi_text: str):
 # ======================================================
 tabs = st.tabs(["270/271", "276/277", "837/835", "Profiles", "Help"])
 
-# ======================================================
-# 270/271 TAB
-# ======================================================
+# ---------------- 270/271 ----------------
 with tabs[0]:
     st.header("🩺 270/271 – Eligibility Inquiry & Response")
     sub_tabs = st.tabs(["Build 270", "Parse 271"])
 
-    # --- Build 270 ---
+    # ===== Build 270 =====
     with sub_tabs[0]:
         profiles = st.session_state.profiles
         pkeys = list(profiles.keys())
@@ -236,19 +228,34 @@ with tabs[0]:
             st.code(edi270)
             st.download_button("⬇️ Download 270", data=edi270.encode(), file_name="270_request.x12", key="t270_dl")
 
-    # --- Parse 271 ---
+    # ===== Parse 271 =====
     with sub_tabs[1]:
         file = st.file_uploader("Upload 271 File", type=["x12", "edi", "txt"], key="t271_upload")
         if file:
             text = file.read().decode("utf-8", errors="ignore")
             parsed = parse_271(text)
-            st.dataframe(parsed["_eb_df"], use_container_width=True)
-            st.json(parsed.get("_summary", {}))
-            st.dataframe(parsed["_aaa_df"], use_container_width=True)
 
-# ======================================================
-# 276/277 TAB
-# ======================================================
+            # 🛡️ Safe fallbacks for both old/new parser versions
+            eb_df = parsed.get("_eb_df") or pd.DataFrame(parsed.get("eb", []))
+            aaa_df = parsed.get("_aaa_df") or pd.DataFrame(parsed.get("aaa", []))
+            summary = parsed.get("_summary") or normalize_eb_for_reporting(parsed.get("eb", []))
+
+            st.subheader("Eligibility Benefits (EB)")
+            if not eb_df.empty:
+                st.dataframe(eb_df, use_container_width=True)
+            else:
+                st.info("No EB segments found.")
+
+            st.subheader("Summary")
+            st.json(summary)
+
+            st.subheader("AAA (Rejections / Errors)")
+            if not aaa_df.empty:
+                st.dataframe(aaa_df, use_container_width=True)
+            else:
+                st.info("No AAA segments found.")
+
+# ---------------- 276/277 ----------------
 with tabs[1]:
     st.header("📨 276/277 – Claim Status Inquiry & Response")
     payer = st.text_input("Payer ID", "12345", key="t276_payer")
@@ -257,6 +264,7 @@ with tabs[1]:
     sub_last = st.text_input("Subscriber Last", "DOE", key="t276_last")
     sub_first = st.text_input("Subscriber First", "JOHN", key="t276_first")
     sub_id = st.text_input("Subscriber ID", "W123456789", key="t276_subid")
+
     if st.button("Generate 276", key="t276_btn"):
         edi276 = build_276(1, 1, 1000, payer, prov, npi, sub_last, sub_first, sub_id)
         st.code(edi276)
@@ -268,9 +276,7 @@ with tabs[1]:
         df = parse_277(text)
         st.dataframe(df, use_container_width=True)
 
-# ======================================================
-# 837/835 TAB
-# ======================================================
+# ---------------- 837/835 ----------------
 with tabs[2]:
     st.header("💰 837/835 – Claims & Payments")
     payer = st.text_input("Payer ID", "12345", key="t837_payer")
@@ -312,19 +318,18 @@ with tabs[2]:
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                            key="t835_excel_dl")
 
-# ======================================================
-# Profiles & Help
-# ======================================================
+# ---------------- Profiles ----------------
 with tabs[3]:
     st.subheader("⚙️ Manage Payer Profiles")
     st.json(st.session_state.profiles)
 
+# ---------------- Help ----------------
 with tabs[4]:
     st.markdown("""
 ### 🧭 Help / Notes
-- **270/271**: Eligibility inquiry and response with table and summary view.
+- **270/271**: Eligibility inquiry and response with summary view.
 - **276/277**: Claim status inquiry/response.
 - **837**: Claim submission generator.
-- **835**: Remittance advice builder & parser with Excel export.
-- **Profiles**: Customize payer-specific 270 configurations (saved in `profiles.json`).
+- **835**: Remittance advice builder & parser (Excel export).
+- **Profiles**: Customize payer-specific 270 configurations.
 """)
