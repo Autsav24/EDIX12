@@ -1,7 +1,7 @@
+# edi_x12.py
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Tuple, Dict, Optional
-import pandas as pd
 
 # ---------------- Defaults & Maps ----------------
 DEFAULT_SEG = "~"
@@ -28,13 +28,13 @@ ServiceTypeMap = {
     "98": "Professional (Physician)",
 }
 
-# ---------------- Built-in Payer Profiles ----------------
+# ---------------- Built-in Payer Profiles (extend via UI in app.py) ----------------
 PAYER_PROFILES: Dict[str, Dict] = {
     "default": {
         "preferred_eq": ["30"],
-        "require_dmg": False,
-        "dependent_require_dmg": False,
-        "dependent_id_required": False,
+        "require_dmg": False,            # Subscriber DMG
+        "dependent_require_dmg": False,  # NEW: Dependent DMG
+        "dependent_id_required": False,  # NEW: Require dependent NM109 when querying 2100D
         "expect_trn": True,
         "id_qual": "MI",
         "subscriber_is_primary": True,
@@ -43,11 +43,12 @@ PAYER_PROFILES: Dict[str, Dict] = {
         "provider_taxonomy": "",
         "include_addresses": False,
     },
+    # Example specialized payer
     "ACME_HEALTH_12345": {
         "preferred_eq": ["30"],
         "require_dmg": True,
         "dependent_require_dmg": True,
-        "dependent_id_required": False,
+        "dependent_id_required": False,  # some payers accept name+DOB only
         "expect_trn": True,
         "id_qual": "MI",
         "subscriber_is_primary": True,
@@ -90,7 +91,7 @@ def split_segments(edi_text: str, seg_t: str) -> List[str]:
 def parse_segments(edi_text: str, seg_t: str, elem_t: str) -> List[List[str]]:
     return [seg.split(elem_t) for seg in split_segments(edi_text, seg_t)]
 
-# ---------------- Envelope Builders ----------------
+# ---------------- Envelopes ----------------
 def build_ISA(control_num: int, sender_id: str, receiver_id: str,
               elem_t: str = DEFAULT_ELEM, seg_t: str = DEFAULT_SEG) -> str:
     now = datetime.utcnow()
@@ -108,6 +109,7 @@ def build_IEA(control_num: int, group_count: int = 1,
 def build_GS(control_num: int, sender_code: str, receiver_code: str,
              elem_t: str = DEFAULT_ELEM, seg_t: str = DEFAULT_SEG) -> str:
     now = datetime.utcnow()
+    # 270 inquiry => GS01 must be HS (HB is for 271 response)
     return elem_t.join([
         "GS","HS",sender_code,receiver_code,now.strftime("%Y%m%d"), now.strftime("%H%M"),
         str(control_num),"X","005010X279A1"
@@ -124,7 +126,7 @@ def build_SE(control_num: int, segment_count: int,
              elem_t: str = DEFAULT_ELEM, seg_t: str = DEFAULT_SEG) -> str:
     return elem_t.join(["SE", str(segment_count), f"{control_num:09d}"]) + seg_t
 
-# ---------------- Data Classes ----------------
+# ---------------- Business objects ----------------
 @dataclass
 class Party:
     last: str
@@ -137,6 +139,147 @@ class Party:
 class Provider:
     name: str
     npi: str
+
+# ---------------- 270 Builder (profile-aware, PRV + N3/N4 + dependent DMG) ----------------
+def build_270(
+    isa_ctrl: int,
+    gs_ctrl: int,
+    st_ctrl: int,
+    payer_id: str,
+    provider: Provider,
+    subscriber: Party,
+    dependent: Optional[Party],
+    service_types: List[str],
+    date_start: str,                  # YYYYMMDD
+    date_end: Optional[str] = None,   # YYYYMMDD
+    profile: Dict = None,
+    trn_trace: Optional[str] = None,
+    dmg_dob: Optional[str] = None,    # subscriber DOB YYYYMMDD
+    dmg_gender: Optional[str] = None, # subscriber Gender M/F/U
+    include_prv: Optional[bool] = None,
+    provider_taxonomy: Optional[str] = None,
+    include_addresses: Optional[bool] = None,
+    provider_addr: Optional[Dict[str, str]] = None,   # {"line1","line2","city","state","zip"}
+    subscriber_addr: Optional[Dict[str, str]] = None, # same
+    # NEW: dependent DMG
+    dep_dmg_dob: Optional[str] = None,
+    dep_dmg_gender: Optional[str] = None,
+    elem_t: str = DEFAULT_ELEM,
+    seg_t: str = DEFAULT_SEG,
+) -> str:
+    prof = profile or PAYER_PROFILES["default"]
+    segs: List[str] = []
+
+    if include_prv is None:
+        include_prv = prof.get("include_prv", False)
+    if not provider_taxonomy:
+        provider_taxonomy = prof.get("provider_taxonomy", "")
+    if include_addresses is None:
+        include_addresses = prof.get("include_addresses", False)
+
+    # Envelope
+    segs.append(build_ISA(isa_ctrl, sender_id="SENDERID", receiver_id="RECEIVERID", elem_t=elem_t, seg_t=seg_t))
+    segs.append(build_GS(gs_ctrl, sender_code="SENDER", receiver_code="RECEIVER", elem_t=elem_t, seg_t=seg_t))
+    segs.append(build_ST(st_ctrl, elem_t=elem_t, seg_t=seg_t))
+
+    # BHT
+    segs.append(elem_t.join(["BHT","0022","13", f"CN{st_ctrl}", datetime.utcnow().strftime("%Y%m%d"), datetime.utcnow().strftime("%H%M")]) + seg_t)
+
+    # 2100A Payer
+    segs.append(elem_t.join(["HL","1","","20","1"]) + seg_t)
+    segs.append(elem_t.join(["NM1","PR","2","PAYER NAME","","","", "PI", payer_id]) + seg_t)
+
+    # 2100B Provider
+    segs.append(elem_t.join(["HL","2","1","21","1"]) + seg_t)
+    segs.append(elem_t.join(["NM1","1P","2",provider.name,"","","","XX",provider.npi]) + seg_t)
+
+    # PRV (taxonomy)
+    if include_prv and provider_taxonomy:
+        segs.append(elem_t.join(["PRV","PE","PXC", provider_taxonomy]) + seg_t)
+
+    # Provider N3/N4
+    if include_addresses and provider_addr:
+        line1 = provider_addr.get("line1",""); line2 = provider_addr.get("line2","")
+        city  = provider_addr.get("city","");  state = provider_addr.get("state",""); zipc = provider_addr.get("zip","")
+        if line1:
+            segs.append(elem_t.join(["N3", line1, line2]) + seg_t if line2 else elem_t.join(["N3", line1]) + seg_t)
+        if city or state or zipc:
+            segs.append(elem_t.join(["N4", city, state, zipc]) + seg_t)
+
+    # Extra REF per profile
+    for ref in prof.get("extra_ref", []):
+        segs.append(elem_t.join(["REF", ref, "PLACEHOLDER"]) + seg_t)
+
+    # 2100C Subscriber
+    has_child = "1" if dependent else "0"
+    sub_id_qual = prof.get("id_qual","MI")
+    segs.append(elem_t.join(["HL","3","2","22",has_child]) + seg_t)
+    segs.append(elem_t.join(["NM1","IL","1",subscriber.last,subscriber.first,subscriber.middle,"",sub_id_qual,subscriber.id_code]) + seg_t)
+
+    # TRN
+    if prof.get("expect_trn") and trn_trace:
+        segs.append(elem_t.join(["TRN","2", trn_trace]) + seg_t)
+
+    # Subscriber N3/N4
+    if include_addresses and subscriber_addr:
+        s_line1 = subscriber_addr.get("line1",""); s_line2 = subscriber_addr.get("line2","")
+        s_city  = subscriber_addr.get("city","");  s_state = subscriber_addr.get("state",""); s_zipc = subscriber_addr.get("zip","")
+        if s_line1:
+            segs.append(elem_t.join(["N3", s_line1, s_line2]) + seg_t if s_line2 else elem_t.join(["N3", s_line1]) + seg_t)
+        if s_city or s_state or s_zipc:
+            segs.append(elem_t.join(["N4", s_city, s_state, s_zipc]) + seg_t)
+
+    # Subscriber DMG
+    if prof.get("require_dmg") or (dmg_dob or dmg_gender):
+        segs.append(elem_t.join(["DMG","D8", (dmg_dob or "19000101"), (dmg_gender or "U")]) + seg_t)
+
+    # DTP (eligibility)
+    if date_end:
+        segs.append(elem_t.join(["DTP","291","RD8", f"{date_start}-{date_end}"]) + seg_t)
+    else:
+        segs.append(elem_t.join(["DTP","291","D8", date_start]) + seg_t)
+
+    # 2100D Dependent
+    if dependent:
+        segs.append(elem_t.join(["HL","4","3","23","0"]) + seg_t)
+
+        # Build NM1*QD with smart handling:
+        dep_last = (dependent.last or "").strip()
+        dep_first = (dependent.first or "").strip()
+        dep_mid = (dependent.middle or "").strip()
+        dep_id = (dependent.id_code or "").strip()
+        dep_id_qual = prof.get("id_qual", "MI")
+
+        # If profile requires dependent ID but it's missing, we still emit NM1 name-only
+        # (payers will reject; but we won't produce syntactically invalid MI* blank).
+        if dep_id:
+            nm1_qd = ["NM1","QD","1", dep_last, dep_first, dep_mid, "", dep_id_qual, dep_id]
+        else:
+            # No ID -> omit qualifier and ID altogether to avoid "MI*"
+            nm1_qd = ["NM1","QD","1", dep_last, dep_first, dep_mid]
+        segs.append(elem_t.join(nm1_qd) + seg_t)
+
+        # Dependent DMG if required or provided
+        if prof.get("dependent_require_dmg") or (dep_dmg_dob or dep_dmg_gender):
+            segs.append(elem_t.join([
+                "DMG","D8",
+                (dep_dmg_dob or "19000101"),
+                (dep_dmg_gender or "U")
+            ]) + seg_t)
+
+    # EQ service types
+    eq_list = service_types or prof.get("preferred_eq", ["30"])
+    for stc in eq_list:
+        segs.append(elem_t.join(["EQ", stc]) + seg_t)
+
+    # Segment count ST..SE
+    current_text = "".join(segs[2:])
+    seg_count = current_text.count(seg_t) + 1
+    segs.append(build_SE(st_ctrl, seg_count, elem_t, seg_t))
+    segs.append(build_GE(gs_ctrl, 1, elem_t, seg_t))
+    segs.append(build_IEA(isa_ctrl, 1, elem_t, seg_t))
+
+    return "".join(segs)
 
 # ---------------- Validators ----------------
 def validate_envelopes(edi_text: str) -> List[str]:
@@ -162,7 +305,7 @@ def validate_envelopes(edi_text: str) -> List[str]:
             warnings.append(f"SE01={declared} but counted {actual} segments between ST..SE.")
     return warnings
 
-# ---------------- 271 Parser (with auto DataFrame output) ----------------
+# ---------------- 271 Parser + post-processing ----------------
 def parse_271(edi_text: str) -> Dict:
     seg_t, elem_t, _ = detect_delimiters(edi_text)
     if "ISA" not in edi_text[:200] and seg_t == DEFAULT_SEG and edi_text.count(DEFAULT_SEG) < 2:
@@ -181,20 +324,37 @@ def parse_271(edi_text: str) -> Dict:
     }
 
     for parts in segs:
-        if not parts:
-            continue
+        if not parts: continue
         tag = parts[0].strip().upper()
 
         if tag == "NM1":
             ent = parts[1].strip().upper() if len(parts) > 1 else ""
             if ent == "PR":
-                out["payer"] = {"name": parts[3] if len(parts) > 3 else "", "id_qual": parts[8] if len(parts) > 8 else "", "id": parts[9] if len(parts) > 9 else ""}
+                out["payer"] = {
+                    "name": parts[3] if len(parts) > 3 else "",
+                    "id_qual": parts[8] if len(parts) > 8 else "",
+                    "id": parts[9] if len(parts) > 9 else "",
+                }
             elif ent == "1P":
-                out["provider"] = {"name": parts[3] if len(parts) > 3 else "", "id_qual": parts[8] if len(parts) > 8 else "", "id": parts[9] if len(parts) > 9 else ""}
+                out["provider"] = {
+                    "name": parts[3] if len(parts) > 3 else "",
+                    "id_qual": parts[8] if len(parts) > 8 else "",
+                    "id": parts[9] if len(parts) > 9 else "",
+                }
             elif ent == "IL":
-                out["subscriber"] = {"last": parts[3] if len(parts) > 3 else "", "first": parts[4] if len(parts) > 4 else "", "id_qual": parts[8] if len(parts) > 8 else "", "id": parts[9] if len(parts) > 9 else ""}
+                out["subscriber"] = {
+                    "last": parts[3] if len(parts) > 3 else "",
+                    "first": parts[4] if len(parts) > 4 else "",
+                    "id_qual": parts[8] if len(parts) > 8 else "",
+                    "id": parts[9] if len(parts) > 9 else "",
+                }
             elif ent == "QD":
-                out["dependent"] = {"last": parts[3] if len(parts) > 3 else "", "first": parts[4] if len(parts) > 4 else "", "id_qual": parts[8] if len(parts) > 8 else "", "id": parts[9] if len(parts) > 9 else ""}
+                out["dependent"] = {
+                    "last": parts[3] if len(parts) > 3 else "",
+                    "first": parts[4] if len(parts) > 4 else "",
+                    "id_qual": parts[8] if len(parts) > 8 else "",
+                    "id": parts[9] if len(parts) > 9 else "",
+                }
 
         elif tag == "TRN":
             out["trace"] = {"trace_type": parts[1] if len(parts) > 1 else "", "trace_num": parts[2] if len(parts) > 2 else ""}
@@ -229,29 +389,20 @@ def parse_271(edi_text: str) -> Dict:
             out["ref"].append(parts)
 
     out["_validation"] = validate_envelopes(edi_text)
-
-    # Convert EB and AAA into DataFrames
-    out["_eb_df"] = pd.DataFrame(out["eb"]) if out["eb"] else pd.DataFrame()
-    out["_aaa_df"] = pd.DataFrame(out["aaa"]) if out["aaa"] else pd.DataFrame()
-
-    # Add summary reporting for EB data
-    out["_summary"] = normalize_eb_for_reporting(out["eb"])
-
     return out
 
-# ---------------- EB Normalizer ----------------
 def normalize_eb_for_reporting(eb_rows: List[Dict]) -> Dict[str, Optional[str]]:
     summary = {"Active": None, "DeductibleRemaining": None, "CoinsurancePercent": None, "CopayAmount": None, "InNetwork": None}
     for r in eb_rows:
         if r.get("EB01") == "1":
             summary["Active"] = "Yes"
-        if "deduct" in (r.get("PlanDesc", "") or "").lower():
-            amt = r.get("BenefitAmt") or r["Raw"].get("E06", "")
+        if "deduct" in (r.get("PlanDesc","") or "").lower():
+            amt = r.get("BenefitAmt") or r["Raw"].get("E06","")
             if amt: summary["DeductibleRemaining"] = amt
         if r.get("Percent"):
             summary["CoinsurancePercent"] = r["Percent"]
-        if "copay" in (r.get("PlanDesc", "") or "").lower():
-            amt = r.get("BenefitAmt") or r["Raw"].get("E06", "")
+        if "copay" in (r.get("PlanDesc","") or "").lower():
+            amt = r.get("BenefitAmt") or r["Raw"].get("E06","")
             if amt: summary["CopayAmount"] = amt
         if r.get("InPlan"):
             summary["InNetwork"] = "Yes" if r["InPlan"] == "Y" else ("No" if r["InPlan"] == "N" else None)
