@@ -1,16 +1,72 @@
-# app.py
+import io, os, json, zipfile
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
-from edi_x12 import Provider, Party, build_270, parse_271
+import importlib
+import edi_x12
+importlib.reload(edi_x12)
+from edi_x12 import (
+    Provider, Party, build_270, parse_271,
+    ServiceTypeMap, PAYER_PROFILES, normalize_eb_for_reporting
+)
 
-st.set_page_config(page_title="X12 EDI Suite - 270/271/276/277/837/835",
-                   page_icon="📡", layout="wide")
+# ======================================================
+# Streamlit Config
+# ======================================================
+st.set_page_config(
+    page_title="X12 EDI Suite - 270/271/276/277/837/835",
+    page_icon="📡", layout="wide"
+)
 st.title("📡 X12 EDI Transaction Suite")
 
 # ======================================================
-# 276 Builder & 277 Parser
+# Profile Management (from old app)
+# ======================================================
+PROFILES_FILE = "profiles.json"
+
+def load_profiles() -> dict:
+    base = {k: v.copy() for k, v in PAYER_PROFILES.items()}
+    if os.path.exists(PROFILES_FILE):
+        try:
+            with open(PROFILES_FILE, "r", encoding="utf-8") as f:
+                user = json.load(f)
+            for k, v in user.items():
+                base[k] = v
+        except Exception:
+            pass
+    return base
+
+def save_profiles(profiles: dict) -> None:
+    with open(PROFILES_FILE, "w", encoding="utf-8") as f:
+        json.dump(profiles, f, indent=2, ensure_ascii=False)
+
+if "profiles" not in st.session_state:
+    st.session_state.profiles = load_profiles()
+
+# ======================================================
+# Helper Functions
+# ======================================================
+def robust_decode(raw: bytes) -> str:
+    if raw.startswith(b"%PDF"):
+        raise ValueError("Not a plain-text X12 file (PDF detected).")
+    if raw[:2] == b"\x1f\x8b":
+        raise ValueError("GZIP detected. Upload uncompressed X12 or a ZIP containing it.")
+    for enc in ("cp1252", "utf-8", "utf-8-sig", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+def normalize_punctuation(text: str) -> str:
+    return (text.replace("\u2013", "-").replace("\u2014", "-")
+                .replace("\u2018", "'").replace("\u2019", "'")
+                .replace("\u201c", '"').replace("\u201d", '"')
+                .replace("\u00a0", " "))
+
+# ======================================================
+# Additional Transaction Builders & Parsers
 # ======================================================
 def build_276(isa_ctrl, gs_ctrl, st_ctrl, payer_id, provider_name, provider_npi,
               subscriber_last, subscriber_first, subscriber_id,
@@ -68,9 +124,7 @@ def parse_277(edi_text: str):
         rows.append(current)
     return pd.DataFrame(rows)
 
-# ======================================================
-# 837 Builder
-# ======================================================
+
 def build_837(payer_id, provider_npi, patient_name, patient_id, claim_id, amount):
     now = datetime.now()
     return f"""ISA*00**00**ZZ*SENDER*ZZ*RECEIVER*{now:%y%m%d}*{now:%H%M}*^*00501*000000001*0*T*:~
@@ -85,9 +139,7 @@ SE*12*0001~
 GE*1*1~
 IEA*1*000000001~"""
 
-# ======================================================
-# 835 Builder & Parser (with Excel Export)
-# ======================================================
+
 def build_835(payer_name, payer_id, provider_npi, claim_id, patient_name, paid_amount):
     now = datetime.now()
     return f"""ISA*00**00**ZZ*{payer_id:<15}*ZZ*RECEIVER*{now:%y%m%d}*{now:%H%M}*^*00501*000000001*0*T*:~
@@ -100,6 +152,7 @@ CLP*{claim_id}*1*150*{paid_amount}**MC*{patient_name}*12*1~
 SE*12*0001~
 GE*1*1~
 IEA*1*000000001~"""
+
 
 def parse_835_to_df(edi_text: str):
     seg_t = "~"
@@ -151,114 +204,142 @@ def parse_835_to_df(edi_text: str):
 # ======================================================
 # Streamlit Tabs
 # ======================================================
-tabs = st.tabs(["270", "271", "276", "277", "837", "835"])
+tabs = st.tabs(["270/271", "276/277", "837/835", "Profiles", "Help"])
 
-# ---------------- 270 ----------------
+# ======================================================
+# 270/271 TAB
+# ======================================================
 with tabs[0]:
-    st.header("🩺 Build 270 – Eligibility Inquiry")
-    payer_id = st.text_input("Payer ID", "12345", key="270_payer")
-    prov = st.text_input("Provider Name", "Buddha Clinic", key="270_prov")
-    npi = st.text_input("Provider NPI", "1234567890", key="270_npi")
-    sub_last = st.text_input("Subscriber Last", "DOE", key="270_last")
-    sub_first = st.text_input("Subscriber First", "JOHN", key="270_first")
-    sub_id = st.text_input("Subscriber ID", "W123456789", key="270_subid")
-    dob = st.text_input("DOB (YYYYMMDD)", "19800101", key="270_dob")
-    gender = st.selectbox("Gender", ["", "M", "F"], key="270_gender")
+    st.header("🩺 270/271 – Eligibility Inquiry & Response")
+    sub_tabs = st.tabs(["Build 270", "Parse 271"])
 
-    if st.button("Generate 270", key="270_btn"):
-        provider = Provider(name=prov, npi=npi)
-        subscriber = Party(last=sub_last, first=sub_first, id_code=sub_id)
-        edi270 = build_270(1, 1, 1000, payer_id, provider, subscriber, None, ["30"],
-                           datetime.today().strftime("%Y%m%d"), None, dmg_dob=dob, dmg_gender=gender)
-        st.code(edi270, language="plain")
-        st.download_button("⬇️ Download 270", data=edi270.encode(), file_name="270_request.x12", key="270_dl")
+    # --- Build 270 ---
+    with sub_tabs[0]:
+        profiles = st.session_state.profiles
+        pkeys = list(profiles.keys())
+        pidx = pkeys.index("default") if "default" in pkeys else 0
+        profile_key = st.selectbox("Payer Profile", options=pkeys, index=pidx)
+        profile = profiles[profile_key]
 
-# ---------------- 271 ----------------
+        payer_id = st.text_input("Payer ID", "12345")
+        prov_name = st.text_input("Provider Name", "Buddha Clinic")
+        npi = st.text_input("Provider NPI", "1234567890")
+        sub_last = st.text_input("Subscriber Last", "DOE")
+        sub_first = st.text_input("Subscriber First", "JOHN")
+        sub_id = st.text_input("Subscriber Member ID", "W123456789")
+        dob = st.text_input("Subscriber DOB (YYYYMMDD)", "19800101")
+        gender = st.selectbox("Gender", ["", "M", "F", "U"])
+        service_types = st.multiselect("Service Types (EQ)",
+                                       list(ServiceTypeMap.keys()),
+                                       default=["30"],
+                                       format_func=lambda x: f"{x} – {ServiceTypeMap.get(x)}")
+
+        if st.button("Generate 270"):
+            provider = Provider(name=prov_name, npi=npi)
+            subscriber = Party(last=sub_last, first=sub_first, id_code=sub_id)
+            edi270 = build_270(1, 1, 1000, payer_id, provider, subscriber, None,
+                               service_types, datetime.today().strftime("%Y%m%d"),
+                               dmg_dob=dob, dmg_gender=gender)
+            st.code(edi270, language="plain")
+            st.download_button("⬇️ Download 270", data=edi270.encode(),
+                               file_name="270_request.x12")
+
+    # --- Parse 271 ---
+    with sub_tabs[1]:
+        file = st.file_uploader("Upload 271 File", type=["x12", "edi", "txt"])
+        if file:
+            text = file.read().decode("utf-8", errors="ignore")
+            parsed = parse_271(text)
+            st.dataframe(parsed["_eb_df"], use_container_width=True)
+            st.subheader("Summary")
+            st.json(parsed["_summary"])
+            st.subheader("AAA (Errors)")
+            st.dataframe(parsed["_aaa_df"], use_container_width=True)
+
+# ======================================================
+# 276/277 TAB
+# ======================================================
 with tabs[1]:
-    st.header("📄 Parse 271 Response")
-    file = st.file_uploader("Upload 271 File", type=["x12", "edi", "txt"], key="271_upload")
-    if file:
-        content = file.read().decode("utf-8", errors="ignore")
-        parsed = parse_271(content)
-        st.json(parsed)
+    st.header("📨 276/277 – Claim Status Inquiry & Response")
+    sub = st.tabs(["Build 276", "Parse 277"])
 
-# ---------------- 276 ----------------
+    with sub[0]:
+        payer = st.text_input("Payer ID", "12345")
+        prov = st.text_input("Provider Name", "Buddha Clinic")
+        npi = st.text_input("Provider NPI", "1234567890")
+        sub_last = st.text_input("Subscriber Last", "DOE")
+        sub_first = st.text_input("Subscriber First", "JOHN")
+        sub_id = st.text_input("Subscriber ID", "W123456789")
+        if st.button("Generate 276"):
+            edi276 = build_276(1, 1, 1000, payer, prov, npi, sub_last, sub_first, sub_id)
+            st.code(edi276)
+            st.download_button("⬇️ Download 276", data=edi276.encode(), file_name="276_request.x12")
+
+    with sub[1]:
+        file = st.file_uploader("Upload 277 File", type=["x12", "edi", "txt"])
+        if file:
+            text = file.read().decode("utf-8", errors="ignore")
+            df = parse_277(text)
+            st.dataframe(df, use_container_width=True)
+
+# ======================================================
+# 837/835 TAB
+# ======================================================
 with tabs[2]:
-    st.header("📨 Build 276 – Claim Status Inquiry")
-    payer = st.text_input("Payer ID", "12345", key="276_payer")
-    prov = st.text_input("Provider Name", "Buddha Clinic", key="276_prov")
-    npi = st.text_input("Provider NPI", "1234567890", key="276_npi")
-    sub_last = st.text_input("Subscriber Last", "DOE", key="276_last")
-    sub_first = st.text_input("Subscriber First", "JOHN", key="276_first")
-    sub_id = st.text_input("Subscriber ID", "W123456789", key="276_subid")
+    st.header("💰 837/835 – Claims & Payments")
+    sub = st.tabs(["Build 837", "Build/Parse 835"])
 
-    if st.button("Generate 276", key="276_btn"):
-        edi276 = build_276(1, 1, 1000, payer, prov, npi, sub_last, sub_first, sub_id)
-        st.code(edi276, language="plain")
-        st.download_button("⬇️ Download 276", data=edi276.encode(), file_name="276_request.x12", key="276_dl")
+    with sub[0]:
+        payer = st.text_input("Payer ID", "12345")
+        npi = st.text_input("Provider NPI", "1234567890")
+        patient = st.text_input("Patient Name", "John Doe")
+        pid = st.text_input("Patient ID", "W123456789")
+        claim = st.text_input("Claim ID", "CLM1001")
+        amt = st.text_input("Amount", "150")
+        if st.button("Generate 837"):
+            edi837 = build_837(payer, npi, patient, pid, claim, amt)
+            st.code(edi837)
+            st.download_button("⬇️ Download 837", edi837.encode(), "837_claim.x12")
 
-# ---------------- 277 ----------------
-with tabs[3]:
-    st.header("📬 Parse 277 – Claim Status Response")
-    file = st.file_uploader("Upload 277 File", type=["x12", "edi", "txt"], key="277_upload")
-    if file:
-        text = file.read().decode("utf-8", errors="ignore")
-        df = parse_277(text)
-        st.dataframe(df, use_container_width=True)
-        out = BytesIO()
-        with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-            df.to_excel(writer, index=False, sheet_name="277_Parsed")
-        out.seek(0)
-        st.download_button("⬇️ Download Excel", out, "277_parsed.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="277_dl")
+    with sub[1]:
+        payer_name = st.text_input("Payer Name", "Insurance Co")
+        payer_id = st.text_input("Payer ID", "12345")
+        prov_npi = st.text_input("Provider NPI", "1234567890")
+        claim = st.text_input("Claim ID", "CLM1001")
+        patient = st.text_input("Patient Name", "John Doe")
+        amt = st.text_input("Paid Amount", "150")
 
-# ---------------- 837 ----------------
-with tabs[4]:
-    st.header("📤 Build 837 – Professional Claim")
-    payer = st.text_input("Payer ID", "12345", key="837_payer")
-    npi = st.text_input("Provider NPI", "1234567890", key="837_npi")
-    patient = st.text_input("Patient Name", "John Doe", key="837_patient")
-    pid = st.text_input("Patient ID", "W123456789", key="837_pid")
-    claim = st.text_input("Claim ID", "CLM1001", key="837_claim")
-    amt = st.text_input("Amount", "150", key="837_amt")
+        if st.button("Generate 835"):
+            edi835 = build_835(payer_name, payer_id, prov_npi, claim, patient, amt)
+            st.code(edi835)
+            st.download_button("⬇️ Download 835", edi835.encode(), "835_remit.x12")
 
-    if st.button("Generate 837", key="837_btn"):
-        edi837 = build_837(payer, npi, patient, pid, claim, amt)
-        st.code(edi837, language="plain")
-        st.download_button("⬇️ Download 837", edi837.encode(), "837_claim.x12", key="837_dl")
-
-# ---------------- 835 ----------------
-with tabs[5]:
-    st.header("💰 835 – Payment / Remittance Advice")
-
-    payer_name = st.text_input("Payer Name", "Insurance Co", key="835_payer")
-    payer_id = st.text_input("Payer ID", "12345", key="835_pid")
-    prov_npi = st.text_input("Provider NPI", "1234567890", key="835_npi")
-    claim = st.text_input("Claim ID", "CLM1001", key="835_claim")
-    patient = st.text_input("Patient Name", "John Doe", key="835_patient")
-    amt = st.text_input("Paid Amount", "150", key="835_amt")
-
-    if st.button("Generate 835", key="835_btn"):
-        edi835 = build_835(payer_name, payer_id, prov_npi, claim, patient, amt)
-        st.code(edi835, language="plain")
-        st.download_button("⬇️ Download 835", edi835.encode(), "835_remit.x12", key="835_dl")
-
-    st.markdown("---")
-    st.subheader("📤 Parse Existing 835 → Excel")
-
-    file = st.file_uploader("Upload 835 File", type=["x12", "edi", "txt"], key="835_upload")
-    if file:
-        text = file.read().decode("utf-8", errors="ignore")
-        df = parse_835_to_df(text)
-        if not df.empty:
+        file = st.file_uploader("Upload 835 File", type=["x12", "edi", "txt"])
+        if file:
+            text = file.read().decode("utf-8", errors="ignore")
+            df = parse_835_to_df(text)
             st.dataframe(df, use_container_width=True)
             out = BytesIO()
             with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
                 df.to_excel(writer, index=False, sheet_name="835_Parsed")
             out.seek(0)
-            st.download_button("⬇️ Download Excel (Parsed 835)", data=out,
-                               file_name=f"835_parsed_{datetime.now():%Y%m%d_%H%M}.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                               key="835_excel_dl")
-        else:
-            st.warning("No claims found in 835 file.")
+            st.download_button("⬇️ Download Excel", data=out,
+                               file_name="835_parsed.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ======================================================
+# Profiles & Help Tabs (from old app)
+# ======================================================
+with tabs[3]:
+    st.subheader("⚙️ Manage Payer Profiles")
+    st.json(st.session_state.profiles)
+
+with tabs[4]:
+    st.markdown("""
+### Help / Notes
+- **270/271**: Eligibility inquiry and response with tabular EB parsing.
+- **276/277**: Claim status inquiry/response.
+- **837**: Professional claim builder.
+- **835**: Remittance/payment builder and parser with Excel export.
+- **Profiles** are saved in `profiles.json` for persistence.
+""")
