@@ -32,9 +32,7 @@ ServiceTypeMap = {
 PAYER_PROFILES: Dict[str, Dict] = {
     "default": {
         "preferred_eq": ["30"],
-        "require_dmg": False,            # Subscriber DMG
-        "dependent_require_dmg": False,  # NEW: Dependent DMG
-        "dependent_id_required": False,  # NEW: Require dependent NM109 when querying 2100D
+        "require_dmg": False,
         "expect_trn": True,
         "id_qual": "MI",
         "subscriber_is_primary": True,
@@ -47,8 +45,6 @@ PAYER_PROFILES: Dict[str, Dict] = {
     "ACME_HEALTH_12345": {
         "preferred_eq": ["30"],
         "require_dmg": True,
-        "dependent_require_dmg": True,
-        "dependent_id_required": False,  # some payers accept name+DOB only
         "expect_trn": True,
         "id_qual": "MI",
         "subscriber_is_primary": True,
@@ -61,6 +57,13 @@ PAYER_PROFILES: Dict[str, Dict] = {
 
 # ---------------- Delimiter utils ----------------
 def detect_delimiters(edi_text: str) -> Tuple[str, str, str]:
+    """
+    From ISA:
+      - element separator at index 3
+      - component separator at index 104 (ISA16, 0-based)
+      - segment terminator at index 105
+    Fallback: if few seg chars but many newlines, use '\n'.
+    """
     seg = DEFAULT_SEG
     elem = DEFAULT_ELEM
     comp = DEFAULT_SUBELEM
@@ -95,6 +98,7 @@ def parse_segments(edi_text: str, seg_t: str, elem_t: str) -> List[List[str]]:
 def build_ISA(control_num: int, sender_id: str, receiver_id: str,
               elem_t: str = DEFAULT_ELEM, seg_t: str = DEFAULT_SEG) -> str:
     now = datetime.utcnow()
+    # Simplified demo ISA (qualifiers 'ZZ', repetition sep '^')
     return elem_t.join([
         "ISA","00","" * 10,"00","" * 10,"ZZ",sender_id.ljust(15),
         "ZZ",receiver_id.ljust(15),
@@ -140,7 +144,7 @@ class Provider:
     name: str
     npi: str
 
-# ---------------- 270 Builder (profile-aware, PRV + N3/N4 + dependent DMG) ----------------
+# ---------------- 270 Builder (profile-aware, PRV + N3/N4) ----------------
 def build_270(
     isa_ctrl: int,
     gs_ctrl: int,
@@ -154,16 +158,13 @@ def build_270(
     date_end: Optional[str] = None,   # YYYYMMDD
     profile: Dict = None,
     trn_trace: Optional[str] = None,
-    dmg_dob: Optional[str] = None,    # subscriber DOB YYYYMMDD
-    dmg_gender: Optional[str] = None, # subscriber Gender M/F/U
+    dmg_dob: Optional[str] = None,    # YYYYMMDD
+    dmg_gender: Optional[str] = None, # M/F/U
     include_prv: Optional[bool] = None,
     provider_taxonomy: Optional[str] = None,
     include_addresses: Optional[bool] = None,
     provider_addr: Optional[Dict[str, str]] = None,   # {"line1","line2","city","state","zip"}
     subscriber_addr: Optional[Dict[str, str]] = None, # same
-    # NEW: dependent DMG
-    dep_dmg_dob: Optional[str] = None,
-    dep_dmg_gender: Optional[str] = None,
     elem_t: str = DEFAULT_ELEM,
     seg_t: str = DEFAULT_SEG,
 ) -> str:
@@ -229,11 +230,15 @@ def build_270(
         if s_city or s_state or s_zipc:
             segs.append(elem_t.join(["N4", s_city, s_state, s_zipc]) + seg_t)
 
-    # Subscriber DMG
+    # DMG
     if prof.get("require_dmg") or (dmg_dob or dmg_gender):
-        segs.append(elem_t.join(["DMG","D8", (dmg_dob or "19000101"), (dmg_gender or "U")]) + seg_t)
+        segs.append(elem_t.join([
+            "DMG","D8",
+            (dmg_dob or "19000101"),
+            (dmg_gender or "U")
+        ]) + seg_t)
 
-    # DTP (eligibility)
+    # DTP
     if date_end:
         segs.append(elem_t.join(["DTP","291","RD8", f"{date_start}-{date_end}"]) + seg_t)
     else:
@@ -241,31 +246,9 @@ def build_270(
 
     # 2100D Dependent
     if dependent:
+        dep_id_qual = prof.get("id_qual","MI")
         segs.append(elem_t.join(["HL","4","3","23","0"]) + seg_t)
-
-        # Build NM1*QD with smart handling:
-        dep_last = (dependent.last or "").strip()
-        dep_first = (dependent.first or "").strip()
-        dep_mid = (dependent.middle or "").strip()
-        dep_id = (dependent.id_code or "").strip()
-        dep_id_qual = prof.get("id_qual", "MI")
-
-        # If profile requires dependent ID but it's missing, we still emit NM1 name-only
-        # (payers will reject; but we won't produce syntactically invalid MI* blank).
-        if dep_id:
-            nm1_qd = ["NM1","QD","1", dep_last, dep_first, dep_mid, "", dep_id_qual, dep_id]
-        else:
-            # No ID -> omit qualifier and ID altogether to avoid "MI*"
-            nm1_qd = ["NM1","QD","1", dep_last, dep_first, dep_mid]
-        segs.append(elem_t.join(nm1_qd) + seg_t)
-
-        # Dependent DMG if required or provided
-        if prof.get("dependent_require_dmg") or (dep_dmg_dob or dep_dmg_gender):
-            segs.append(elem_t.join([
-                "DMG","D8",
-                (dep_dmg_dob or "19000101"),
-                (dep_dmg_gender or "U")
-            ]) + seg_t)
+        segs.append(elem_t.join(["NM1","QD","1",dependent.last,dependent.first,dependent.middle,"",dep_id_qual,dependent.id_code]) + seg_t)
 
     # EQ service types
     eq_list = service_types or prof.get("preferred_eq", ["30"])
@@ -283,6 +266,7 @@ def build_270(
 
 # ---------------- Validators ----------------
 def validate_envelopes(edi_text: str) -> List[str]:
+    """Light checks: ST/SE segment count."""
     warnings: List[str] = []
     seg_t, elem_t, _ = detect_delimiters(edi_text)
     segs = parse_segments(edi_text, seg_t, elem_t)
@@ -357,7 +341,10 @@ def parse_271(edi_text: str) -> Dict:
                 }
 
         elif tag == "TRN":
-            out["trace"] = {"trace_type": parts[1] if len(parts) > 1 else "", "trace_num": parts[2] if len(parts) > 2 else ""}
+            out["trace"] = {
+                "trace_type": parts[1] if len(parts) > 1 else "",
+                "trace_num": parts[2] if len(parts) > 2 else "",
+            }
 
         elif tag == "EB":
             eb = {f"E{i:02d}": (parts[i] if len(parts) > i else "") for i in range(1, 14)}
@@ -380,7 +367,10 @@ def parse_271(edi_text: str) -> Dict:
             out["eb"].append(rec)
 
         elif tag == "AAA":
-            out["aaa"].append({"reject_code": parts[3] if len(parts) > 3 else "", "followup_action": parts[4] if len(parts) > 4 else ""})
+            out["aaa"].append({
+                "reject_code": parts[3] if len(parts) > 3 else "",
+                "followup_action": parts[4] if len(parts) > 4 else "",
+            })
 
         elif tag == "DTP":
             out["dtp"].append(parts)
@@ -392,7 +382,13 @@ def parse_271(edi_text: str) -> Dict:
     return out
 
 def normalize_eb_for_reporting(eb_rows: List[Dict]) -> Dict[str, Optional[str]]:
-    summary = {"Active": None, "DeductibleRemaining": None, "CoinsurancePercent": None, "CopayAmount": None, "InNetwork": None}
+    summary = {
+        "Active": None,
+        "DeductibleRemaining": None,
+        "CoinsurancePercent": None,
+        "CopayAmount": None,
+        "InNetwork": None,
+    }
     for r in eb_rows:
         if r.get("EB01") == "1":
             summary["Active"] = "Yes"
