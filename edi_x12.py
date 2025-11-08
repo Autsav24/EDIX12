@@ -1,7 +1,9 @@
-import streamlit as st
+from dataclasses import dataclass
+from datetime import datetime
+from typing import List, Tuple, Dict, Optional
 import pandas as pd
-import io
-from edi_x12 import parse_271_to_table
+import os
+
 
 st.set_page_config(page_title="EDI 271 Parser", layout="wide")
 
@@ -36,3 +38,4 @@ if uploaded_file:
         )
 else:
     st.info("👆 Upload an EDI 271 file to begin.")
+
