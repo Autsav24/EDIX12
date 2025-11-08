@@ -1,5 +1,3 @@
-
-You said:
 # edi_x12.py
 from dataclasses import dataclass
 from datetime import datetime
